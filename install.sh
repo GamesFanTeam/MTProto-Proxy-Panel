@@ -1,133 +1,232 @@
 #!/usr/bin/env bash
-# Telemt Direct Telegram DC probe
+# Telemt inbound DPI bypass patch: server-advertised TCP MSS fragmentation
 # Version: 1.0
-# Purpose: collect evidence for Direct egress failures without changing Telemt/WARP/config.
+#
+# Purpose:
+#   Keep Telemt Direct egress untouched, but fragment the Telegram client's
+#   inbound Fake-TLS ClientHello by advertising a small TCP MSS from VPS:443.
+#
+# Why:
+#   Current DPI identifies the official Telegram MTProxy Fake-TLS client-side
+#   packet pattern. This patch changes packetization without WARP/Cascade.
+#
+# Usage:
+#   sudo bash ./telemt-antidpi-mss-v1.0.sh apply
+#   sudo bash ./telemt-antidpi-mss-v1.0.sh status
+#   sudo bash ./telemt-antidpi-mss-v1.0.sh remove
+#
+# Optional:
+#   PORT=443 MSS=88 sudo -E bash ./telemt-antidpi-mss-v1.0.sh apply
+#
+# Notes:
+#   - New TCP sessions only. Existing Telegram connection attempts must be retried.
+#   - MSS=88 is intentionally aggressive for the first DPI-bypass test.
+#   - The rule affects only SYN/SYN-ACK packets sourced from Telemt's public port.
+#   - Telemt config, secret, Direct routing and service binary are not modified.
 
-set -uo pipefail
+set -Eeuo pipefail
+umask 077
 
-readonly OUT="/root/telemt-direct-dc-probe-$(date -u +%Y%m%dT%H%M%SZ).log"
-readonly CONFIG="/etc/telemt/telemt.toml"
-readonly API="http://127.0.0.1:9091"
-readonly -a DC4_ENDPOINTS=(
-  "149.154.175.50:443:DC1"
-  "149.154.167.51:443:DC2"
-  "149.154.175.100:443:DC3"
-  "149.154.167.91:443:DC4"
-  "149.154.171.5:443:DC5"
-  "91.105.192.100:443:DC203"
-)
-readonly -a DC6_ENDPOINTS=(
-  "[2001:b28:f23d:f001::a]:443:DC1"
-  "[2001:67c:4e8:f002::a]:443:DC2"
-  "[2001:b28:f23d:f003::a]:443:DC3"
-  "[2001:67c:4e8:f004::a]:443:DC4"
-  "[2001:b28:f23f:f005::a]:443:DC5"
-)
+readonly VERSION="1.0"
+readonly PATCH_NAME="telemt-antidpi-mss"
+readonly HELPER="/usr/local/sbin/${PATCH_NAME}"
+readonly UNIT="/etc/systemd/system/${PATCH_NAME}.service"
+readonly BACKUP_ROOT="/var/backups/${PATCH_NAME}"
+readonly LOG="/var/log/${PATCH_NAME}.log"
+readonly SERVICE="telemt"
 
-exec > >(tee "$OUT") 2>&1
+ACTION="${1:-apply}"
+PORT="${PORT:-443}"
+MSS="${MSS:-88}"
+BACKUP_DIR=""
 
-header() { printf '\n===== %s =====\n' "$*"; }
-run() {
-  printf '\n$ %s\n' "$*"
-  "$@" 2>&1 || true
+mkdir -p "$(dirname "$LOG")"
+touch "$LOG"
+chmod 600 "$LOG"
+exec > >(tee -a "$LOG") 2>&1
+
+info() { printf '\033[1;36m[INFO]\033[0m %s\n' "$*"; }
+ok()   { printf '\033[1;32m[ OK ]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$*"; }
+fail() { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
+
+require_root() {
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || fail "Запустите через sudo/root."
 }
 
-tcp_probe() {
-  local host="$1" port="$2" name="$3" family="$4" start end elapsed
-  start="$(date +%s%3N)"
-  if [[ "$family" == "4" ]]; then
-    if timeout 4 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null; then
-      end="$(date +%s%3N)"; elapsed=$((end - start))
-      printf '%-5s IPv4 %-25s OK   %4s ms\n' "$name" "${host}:${port}" "$elapsed"
-    else
-      printf '%-5s IPv4 %-25s FAIL timeout/refused\n' "$name" "${host}:${port}"
-    fi
-  else
-    # curl connect-only is used for IPv6 parsing; HTTP response is irrelevant.
-    if timeout 5 curl -6 -ksS --connect-timeout 4 --max-time 4 "https://[${host}]:${port}/" -o /dev/null 2>/dev/null; then
-      end="$(date +%s%3N)"; elapsed=$((end - start))
-      printf '%-5s IPv6 %-39s OK   %4s ms\n' "$name" "[${host}]:${port}" "$elapsed"
-    else
-      printf '%-5s IPv6 %-39s FAIL timeout/unreachable\n' "$name" "[${host}]:${port}"
-    fi
-  fi
+validate_input() {
+  [[ "$ACTION" =~ ^(apply|status|remove)$ ]] || fail "Действие: apply | status | remove"
+  [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) ||
+    fail "PORT должен быть в диапазоне 1..65535."
+  [[ "$MSS" =~ ^[0-9]+$ ]] && (( MSS >= 64 && MSS <= 1460 )) ||
+    fail "MSS должен быть в диапазоне 64..1460."
 }
 
-redacted_config() {
-  if [[ ! -f "$CONFIG" ]]; then
-    echo "Config not found: $CONFIG"
-    return
-  fi
-  sed -E \
-    -e 's/^([[:space:]]*[A-Za-z0-9_.-]+[[:space:]]*=[[:space:]]*")[0-9a-fA-F]{32}(".*)$/\1<REDACTED_32HEX>\2/' \
-    -e 's/^([[:space:]]*ad_tag[[:space:]]*=[[:space:]]*").*(".*)$/\1<REDACTED>\2/' \
-    "$CONFIG"
+apt_install_iptables_if_needed() {
+  command -v iptables >/dev/null 2>&1 && return 0
+  info "Устанавливаю iptables с безопасным ожиданием apt/dpkg lock."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get -o DPkg::Lock::Timeout=600 update -y
+  apt-get -o DPkg::Lock::Timeout=600 install -y --no-install-recommends iptables
 }
 
-header "Telemt Direct DC probe v1.0"
-echo "Generated UTC: $(date -u --iso-8601=seconds)"
-echo "IMPORTANT: run this while WARP/Cascade/VPN egress is OFF."
+backup_previous_patch() {
+  BACKUP_DIR="${BACKUP_ROOT}/$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p "$BACKUP_DIR"
+  [[ -f "$HELPER" ]] && cp -a "$HELPER" "$BACKUP_DIR/"
+  [[ -f "$UNIT" ]] && cp -a "$UNIT" "$BACKUP_DIR/"
+}
 
-header "Public/network identity"
-run uname -a
-run ip -br addr
-run ip -4 route
-run ip -6 route
-printf '\n$ curl public IPv4/IPv6\n'
-curl -4fsS --max-time 8 https://api.ipify.org 2>/dev/null || echo "IPv4 public IP unavailable"
-printf '\n'
-curl -6fsS --max-time 8 https://api64.ipify.org 2>/dev/null || echo "IPv6 public IP unavailable"
-printf '\n'
+write_helper() {
+  cat > "$HELPER" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-header "WARP/WireGuard indicators"
-run systemctl is-active warp-svc
-run systemctl is-active wg-quick@wgcf
-run systemctl is-active wg-quick@warp
-run wg show
-run ip rule show
+PORT="\${PORT:-${PORT}}"
+MSS="\${MSS:-${MSS}}"
+CHAIN="TELEMT_ANTIDPI_MSS"
 
-header "Telemt unit/listeners"
-run systemctl status telemt --no-pager -l
-run ss -ltnp
-run ss -lunp
+iptables_cmd() {
+  command -v iptables >/dev/null 2>&1 && command -v iptables
+}
+ip6tables_cmd() {
+  command -v ip6tables >/dev/null 2>&1 && command -v ip6tables || true
+}
 
-header "Telemt config, secrets redacted"
-redacted_config
+apply_family() {
+  local cmd="\$1"
+  "\$cmd" -w 10 -t mangle -N "\$CHAIN" 2>/dev/null || true
+  "\$cmd" -w 10 -t mangle -F "\$CHAIN"
+  "\$cmd" -w 10 -t mangle -A "\$CHAIN" \
+    -p tcp --sport "\$PORT" --tcp-flags SYN,RST SYN \
+    -j TCPMSS --set-mss "\$MSS"
+  "\$cmd" -w 10 -t mangle -C OUTPUT -j "\$CHAIN" >/dev/null 2>&1 ||
+    "\$cmd" -w 10 -t mangle -I OUTPUT 1 -j "\$CHAIN"
+}
 
-header "Telemt local API with HTTP status"
-for endpoint in \
-  /v1/health/ready \
-  /v1/runtime/gates \
-  /v1/runtime/upstream_quality \
-  /v1/stats/upstreams \
-  /v1/users; do
-  printf '\n--- %s ---\n' "$endpoint"
-  curl -sS -i --connect-timeout 2 --max-time 5 "${API}${endpoint}" 2>&1 || true
-  printf '\n'
-done
-
-header "Direct TCP probes to Telegram DC IPv4 :443"
-for item in "${DC4_ENDPOINTS[@]}"; do
-  IFS=: read -r host port name <<< "$item"
-  tcp_probe "$host" "$port" "$name" 4
-done
-
-header "Direct TCP probes to Telegram DC IPv6 :443"
-if ip -6 route show default 2>/dev/null | grep -q default; then
-  for item in "${DC6_ENDPOINTS[@]}"; do
-    tmp="${item#[}"; host="${tmp%%]*}"
-    rest="${tmp#*]:}"; port="${rest%%:*}"; name="${rest##*:}"
-    tcp_probe "$host" "$port" "$name" 6
+remove_family() {
+  local cmd="\$1"
+  while "\$cmd" -w 10 -t mangle -C OUTPUT -j "\$CHAIN" >/dev/null 2>&1; do
+    "\$cmd" -w 10 -t mangle -D OUTPUT -j "\$CHAIN"
   done
-else
-  echo "IPv6 default route absent; IPv6 direct fallback cannot be tested."
-fi
+  "\$cmd" -w 10 -t mangle -F "\$CHAIN" >/dev/null 2>&1 || true
+  "\$cmd" -w 10 -t mangle -X "\$CHAIN" >/dev/null 2>&1 || true
+}
 
-header "Telemt connectivity/upstream logs"
-journalctl -u telemt --no-pager -n 500 2>&1 | \
-  grep -Ei 'Telegram DC Connectivity|via direct|DC[0-9]|upstream|connectivity|healthy|FAIL|timeout|Transport|Network capabilities|route|error|warn' || true
+show_family() {
+  local label="\$1" cmd="\$2"
+  printf '\n--- %s ---\n' "\$label"
+  "\$cmd" -w 10 -t mangle -L "\$CHAIN" -n -v --line-numbers 2>&1 || echo "rule absent"
+}
 
-header "Saved"
-echo "$OUT"
-echo
-echo "Send this log back for an exact Direct-only correction."
+case "\${1:-apply}" in
+  apply)
+    IPT="\$(iptables_cmd)"
+    apply_family "\$IPT"
+    IP6T="\$(ip6tables_cmd)"
+    [[ -n "\$IP6T" ]] && apply_family "\$IP6T" || true
+    ;;
+  remove)
+    IPT="\$(iptables_cmd)"
+    remove_family "\$IPT"
+    IP6T="\$(ip6tables_cmd)"
+    [[ -n "\$IP6T" ]] && remove_family "\$IP6T" || true
+    ;;
+  status)
+    IPT="\$(iptables_cmd)"
+    show_family "IPv4 OUTPUT / TCPMSS" "\$IPT"
+    IP6T="\$(ip6tables_cmd)"
+    [[ -n "\$IP6T" ]] && show_family "IPv6 OUTPUT / TCPMSS" "\$IP6T" || true
+    ;;
+  *)
+    echo "Usage: \$0 apply|remove|status" >&2
+    exit 2
+    ;;
+esac
+EOF
+  chmod 0755 "$HELPER"
+}
+
+write_unit() {
+  cat > "$UNIT" <<EOF
+[Unit]
+Description=Telemt inbound anti-DPI TCPMSS fragmentation (TCP/${PORT}, MSS=${MSS})
+After=network-pre.target
+Before=telemt.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=${HELPER} apply
+ExecStop=${HELPER} remove
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 0644 "$UNIT"
+  systemctl daemon-reload
+}
+
+show_status() {
+  printf '\n===== Telemt inbound anti-DPI MSS status =====\n'
+  systemctl status "$PATCH_NAME.service" --no-pager -l 2>&1 || true
+  [[ -x "$HELPER" ]] && "$HELPER" status || warn "Helper ещё не установлен."
+  printf '\nTelemt listener:\n'
+  ss -H -ltnp "sport = :${PORT}" 2>/dev/null || true
+  printf '\nПоследние handshake-события:\n'
+  journalctl -u "$SERVICE" --no-pager -n 80 2>/dev/null |
+    grep -Ei 'handshake|connection|unknown sni|Listening|direct|DC[0-9]' || true
+}
+
+apply_patch() {
+  apt_install_iptables_if_needed
+
+  systemctl is-active --quiet "$SERVICE" ||
+    warn "telemt сейчас не active; правило установится, но проверка соединения возможна после запуска telemt."
+
+  if ! ss -H -ltn "sport = :${PORT}" 2>/dev/null | grep -q ":${PORT}"; then
+    warn "Listener TCP/${PORT} сейчас не найден. Проверь, что Telemt слушает этот порт."
+  fi
+
+  backup_previous_patch
+  write_helper
+  write_unit
+
+  systemctl enable "$PATCH_NAME.service" >/dev/null
+  systemctl restart "$PATCH_NAME.service"
+
+  ok "Включён входной DPI-bypass: TCPMSS=${MSS} для новых соединений к Telemt TCP/${PORT}."
+  info "Маршрут Telemt → Telegram DC, конфиг и secret не менялись."
+  info "Backup предыдущей версии patch: ${BACKUP_DIR}"
+  show_status
+
+  printf '\nПРОВЕРКА СЕЙЧАС:\n'
+  printf '1) На телефоне выключи WARP.\n'
+  printf '2) Отключи/включи этот же MTProxy в Telegram, чтобы создать новый TCP-сеанс.\n'
+  printf '3) Через 10 секунд выполни:\n'
+  printf '   sudo bash %s status\n' "$0"
+  printf '\nВ status у правила TCPMSS счётчик pkts должен стать > 0.\n'
+}
+
+remove_patch() {
+  if [[ -x "$HELPER" ]]; then
+    "$HELPER" remove || true
+  fi
+  systemctl disable --now "$PATCH_NAME.service" >/dev/null 2>&1 || true
+  rm -f "$UNIT" "$HELPER"
+  systemctl daemon-reload
+  ok "Anti-DPI TCPMSS patch полностью удалён. Telemt/config не изменялись."
+}
+
+main() {
+  require_root
+  validate_input
+  case "$ACTION" in
+    apply) apply_patch ;;
+    status) show_status ;;
+    remove) remove_patch ;;
+  esac
+}
+
+main "$@"
