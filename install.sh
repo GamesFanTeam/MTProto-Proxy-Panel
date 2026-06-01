@@ -1,66 +1,62 @@
 #!/usr/bin/env bash
-# Telemt Direct + Fake TLS + inbound anti-DPI one-click installer
-# Version: 1.5 — fix Direct boolean verification plus TCPMSS ClientHello fragmentation
+# Teleproxy Direct + Fake-TLS DPI-hardening A/B test installer
+# Version: 0.2-test — adds explicit post-test restore
 #
-# Baseline route:
-#   Telegram client -> VPS:443 -> Telemt -> Telegram DC (Direct)
+# Goal:
+#   Replace the Telemt inbound engine for an isolated no-WARP client test,
+#   while preserving server egress as Direct -> Telegram DC.
 #
-# Policy:
-#   - Telemt is pinned to 3.4.13.
-#   - Middle Proxy / ad_tag / sponsor mode are not configured.
-#   - Cascade is not configured or activated by this standalone installer.
-#   - Fake TLS SNI defaults to mts.ru for this diagnostic compatibility profile.
-#   - A fresh per-server secret is generated; the supplied working proxy's secret is never reused.
-#   - Telemt Direct is verified before success is reported.
-#   - Inbound anti-DPI TCPMSS fragmentation is enabled after Telemt is ready.
-#   - Output includes the official Telemt API TLS link and an equivalent Base64URL form.
+# Engine under test:
+#   Teleproxy v4.14.1 (pinned), direct=true, Fake-TLS domain=mts.ru.
+#
+# Notes:
+#   - This is an A/B migration test, not a guarantee against every network.
+#   - It backs up and stops an existing Telemt installation occupying :443.
+#   - It disables/removes the previous standalone TCPMSS patch before testing,
+#     because Teleproxy v4.14.1 ships automatic ClientHello fragmentation.
+#   - On any install/health failure, it attempts to restore the previous Telemt state.
 #
 # Run:
-#   sudo bash ./mtproto-telemt-direct-antidpi-v1.5.sh
+#   sudo bash ./mtproto-teleproxy-direct-dpi-test-v0.2.sh
 #
 # Optional:
-#   SNI=vk.com sudo -E bash ./mtproto-telemt-direct-antidpi-v1.5.sh
-#   MSS=88 PORT=443 SERVER_HOST=proxy.example.com sudo -E bash ./mtproto-telemt-direct-antidpi-v1.5.sh
-#   ROTATE_SECRET=1 sudo -E bash ./mtproto-telemt-direct-antidpi-v1.5.sh
+#   DOMAIN=ya.ru sudo -E bash ./mtproto-teleproxy-direct-dpi-test-v0.2.sh
+#
+# Roll back after a failed no-WARP connection test:
+#   sudo bash ./mtproto-teleproxy-direct-dpi-test-v0.2.sh restore
+#   sudo bash ./mtproto-teleproxy-direct-dpi-test-v0.2.sh restore /var/backups/teleproxy-direct-dpi-test/<timestamp>
 
 set -Eeuo pipefail
 umask 077
 
-readonly INSTALLER_VERSION="1.5"
-readonly TELEMT_VERSION="3.4.13"
-readonly SERVICE_NAME="telemt"
-readonly USERNAME="main"
-readonly CONFIG_DIR="/etc/telemt"
-readonly CONFIG_FILE="${CONFIG_DIR}/telemt.toml"
-readonly DATA_DIR="/var/lib/telemt"
-readonly TLS_FRONT_DIR="${DATA_DIR}/tlsfront"
-readonly WORK_DIR="/opt/telemt"
-readonly BINARY_PATH="/usr/local/bin/telemt"
-readonly SERVICE_FILE="/etc/systemd/system/telemt.service"
-readonly STATE_FILE="${CONFIG_DIR}/direct-faketls.state"
-readonly LINK_FILE="/root/mtproto-proxy-link.txt"
-readonly LOG_FILE="/var/log/telemt-direct-faketls-install.log"
-readonly BACKUP_ROOT="/var/backups/telemt-direct-faketls"
-readonly STARTUP_TIMEOUT_SECONDS=120
-readonly APT_LOCK_TIMEOUT_SECONDS=600
-readonly ANTIDPI_HELPER="/usr/local/sbin/telemt-antidpi-mss"
-readonly ANTIDPI_SERVICE="telemt-antidpi-mss.service"
-readonly ANTIDPI_UNIT="/etc/systemd/system/${ANTIDPI_SERVICE}"
-readonly -a ALLOWED_SNI=("mts.ru" "vk.com" "yandex.ru" "ozon.ru" "mail.ru" "max.ru" "sber.ru")
+readonly SCRIPT_VERSION="0.2-test"
+readonly TELEPROXY_VERSION="4.14.1"
+readonly PORT="${PORT:-443}"
+readonly STATS_PORT="${STATS_PORT:-8888}"
+readonly DOMAIN="${DOMAIN:-mts.ru}"
+readonly SECRET="${SECRET:-$(openssl rand -hex 16)}"
+readonly INSTALLER_URL="https://raw.githubusercontent.com/teleproxy/teleproxy/v${TELEPROXY_VERSION}/install.sh"
+readonly BACKUP_ROOT="/var/backups/teleproxy-direct-dpi-test"
+readonly LOG_FILE="/var/log/teleproxy-direct-dpi-test.log"
+readonly LINK_FILE="/root/teleproxy-direct-dpi-test-link.txt"
+readonly TELEMT_SERVICE="/etc/systemd/system/telemt.service"
+readonly TELEMT_CONFIG_DIR="/etc/telemt"
+readonly TELEMT_BINARY="/usr/local/bin/telemt"
+readonly OLD_DPI_SERVICE="/etc/systemd/system/telemt-antidpi-mss.service"
+readonly OLD_DPI_HELPER="/usr/local/sbin/telemt-antidpi-mss"
+readonly TELEPROXY_SERVICE="/etc/systemd/system/teleproxy.service"
+readonly TELEPROXY_CONFIG_DIR="/etc/teleproxy"
+readonly TELEPROXY_BINARY="/usr/local/bin/teleproxy"
 
-PORT="${PORT:-443}"
-SNI="${SNI:-mts.ru}"
-SERVER_HOST="${SERVER_HOST:-}"
-ROTATE_SECRET="${ROTATE_SECRET:-0}"
-MSS="${MSS:-88}"
+ACTION="${1:-install}"
+RESTORE_DIR="${2:-}"
 
-SECRET=""
 BACKUP_DIR=""
-MUTATION_STARTED=0
+TELEMT_WAS_ACTIVE=0
+OLD_DPI_WAS_ACTIVE=0
+TELEPROXY_WAS_ACTIVE=0
+MUTATED=0
 COMMITTED=0
-HAD_OLD_BINARY=0
-HAD_OLD_CONFIG=0
-HAD_OLD_SERVICE=0
 
 mkdir -p "$(dirname "$LOG_FILE")"
 touch "$LOG_FILE"
@@ -68,573 +64,253 @@ chmod 600 "$LOG_FILE"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 info() { printf '\033[1;36m[INFO]\033[0m %s\n' "$*"; }
-ok()   { printf '\033[1;32m[ OK ]\033[0m %s\n' "$*"; }
+ok() { printf '\033[1;32m[ OK ]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; return 1; }
 
-restore_previous_installation() {
-  (( MUTATION_STARTED == 1 && COMMITTED == 0 )) || return 0
-  warn "Откат: восстанавливаю файлы, которые были до запуска installer."
+require_root() {
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || fail "Запусти от root: sudo bash $0"
+}
 
-  systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+validate_inputs() {
+  [[ "$ACTION" == "install" || "$ACTION" == "restore" ]] ||
+    fail "Команда: install или restore."
+  [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) ||
+    fail "PORT должен быть в диапазоне 1..65535."
+  [[ "$STATS_PORT" =~ ^[0-9]+$ ]] && (( STATS_PORT >= 1 && STATS_PORT <= 65535 )) ||
+    fail "STATS_PORT должен быть в диапазоне 1..65535."
+  [[ "$SECRET" =~ ^[0-9a-fA-F]{32}$ ]] ||
+    fail "SECRET должен быть 32-символьным HEX secret."
+  [[ "$DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]] ||
+    fail "DOMAIN содержит недопустимые символы."
+}
 
-  if (( HAD_OLD_BINARY == 1 )); then
-    install -m 0755 "$BACKUP_DIR/telemt.binary" "$BINARY_PATH" || true
+backup_file_or_dir() {
+  local source="$1" target_name="$2"
+  [[ -e "$source" ]] && cp -a "$source" "$BACKUP_DIR/$target_name"
+}
+
+backup_existing_state() {
+  BACKUP_DIR="${BACKUP_ROOT}/$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p "$BACKUP_DIR"
+
+  systemctl is-active --quiet telemt 2>/dev/null && TELEMT_WAS_ACTIVE=1 || true
+  systemctl is-active --quiet telemt-antidpi-mss.service 2>/dev/null && OLD_DPI_WAS_ACTIVE=1 || true
+  systemctl is-active --quiet teleproxy 2>/dev/null && TELEPROXY_WAS_ACTIVE=1 || true
+
+  backup_file_or_dir "$TELEMT_CONFIG_DIR" "telemt-config"
+  backup_file_or_dir "$TELEMT_SERVICE" "telemt.service"
+  backup_file_or_dir "$TELEMT_BINARY" "telemt.binary"
+  backup_file_or_dir "$OLD_DPI_SERVICE" "telemt-antidpi-mss.service"
+  backup_file_or_dir "$OLD_DPI_HELPER" "telemt-antidpi-mss.helper"
+  backup_file_or_dir "$TELEPROXY_CONFIG_DIR" "teleproxy-config"
+  backup_file_or_dir "$TELEPROXY_SERVICE" "teleproxy.service"
+  backup_file_or_dir "$TELEPROXY_BINARY" "teleproxy.binary"
+
+  cat > "$BACKUP_DIR/state.env" <<EOF
+TELEMT_WAS_ACTIVE=${TELEMT_WAS_ACTIVE}
+OLD_DPI_WAS_ACTIVE=${OLD_DPI_WAS_ACTIVE}
+TELEPROXY_WAS_ACTIVE=${TELEPROXY_WAS_ACTIVE}
+EOF
+  chmod 600 "$BACKUP_DIR/state.env"
+  ok "Backup создан: $BACKUP_DIR"
+}
+
+remove_old_antidpi_rule() {
+  if systemctl list-unit-files 2>/dev/null | grep -q '^telemt-antidpi-mss.service'; then
+    systemctl disable --now telemt-antidpi-mss.service >/dev/null 2>&1 || true
+  fi
+  if [[ -x "$OLD_DPI_HELPER" ]]; then
+    "$OLD_DPI_HELPER" remove >/dev/null 2>&1 || true
+  fi
+  info "Старый внешний TCPMSS patch отключён для чистого A/B-теста."
+}
+
+restore_from_backup() {
+  if [[ -n "$RESTORE_DIR" ]]; then
+    BACKUP_DIR="$RESTORE_DIR"
   else
-    rm -f "$BINARY_PATH" || true
+    BACKUP_DIR="$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR==1 {print $2}')"
+  fi
+  [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR" && -f "$BACKUP_DIR/state.env" ]] ||
+    fail "Backup для восстановления не найден. Укажи каталог вторым аргументом."
+
+  # shellcheck source=/dev/null
+  source "$BACKUP_DIR/state.env"
+
+  info "Возвращаю состояние из backup: $BACKUP_DIR"
+  systemctl disable --now teleproxy >/dev/null 2>&1 || true
+  rm -rf "$TELEPROXY_CONFIG_DIR"
+  rm -f "$TELEPROXY_SERVICE" "$TELEPROXY_BINARY"
+
+  if [[ -d "$BACKUP_DIR/teleproxy-config" ]]; then
+    cp -a "$BACKUP_DIR/teleproxy-config" "$TELEPROXY_CONFIG_DIR"
+  fi
+  [[ -f "$BACKUP_DIR/teleproxy.service" ]] && cp -a "$BACKUP_DIR/teleproxy.service" "$TELEPROXY_SERVICE"
+  [[ -f "$BACKUP_DIR/teleproxy.binary" ]] && cp -a "$BACKUP_DIR/teleproxy.binary" "$TELEPROXY_BINARY"
+
+  if [[ -d "$BACKUP_DIR/telemt-config" ]]; then
+    rm -rf "$TELEMT_CONFIG_DIR"
+    cp -a "$BACKUP_DIR/telemt-config" "$TELEMT_CONFIG_DIR"
+  fi
+  [[ -f "$BACKUP_DIR/telemt.service" ]] && cp -a "$BACKUP_DIR/telemt.service" "$TELEMT_SERVICE"
+  [[ -f "$BACKUP_DIR/telemt.binary" ]] && cp -a "$BACKUP_DIR/telemt.binary" "$TELEMT_BINARY"
+
+  rm -f "$OLD_DPI_SERVICE" "$OLD_DPI_HELPER"
+  [[ -f "$BACKUP_DIR/telemt-antidpi-mss.service" ]] && cp -a "$BACKUP_DIR/telemt-antidpi-mss.service" "$OLD_DPI_SERVICE"
+  [[ -f "$BACKUP_DIR/telemt-antidpi-mss.helper" ]] && cp -a "$BACKUP_DIR/telemt-antidpi-mss.helper" "$OLD_DPI_HELPER"
+
+  systemctl daemon-reload
+  if [[ "${TELEMT_WAS_ACTIVE:-0}" == "1" ]]; then
+    systemctl enable --now telemt >/dev/null
+  fi
+  if [[ "${OLD_DPI_WAS_ACTIVE:-0}" == "1" && -f "$OLD_DPI_SERVICE" ]]; then
+    systemctl enable --now telemt-antidpi-mss.service >/dev/null || true
+  fi
+  if [[ "${TELEPROXY_WAS_ACTIVE:-0}" == "1" && -f "$TELEPROXY_SERVICE" ]]; then
+    systemctl enable --now teleproxy >/dev/null || true
   fi
 
-  if (( HAD_OLD_CONFIG == 1 )); then
-    install -D -m 0640 "$BACKUP_DIR/telemt.toml" "$CONFIG_FILE" || true
-    chown root:telemt "$CONFIG_FILE" 2>/dev/null || true
-  else
-    rm -f "$CONFIG_FILE" "$STATE_FILE" || true
-  fi
+  ok "Восстановление завершено."
+  systemctl status telemt --no-pager -l 2>/dev/null || true
+}
 
-  if (( HAD_OLD_SERVICE == 1 )); then
-    install -m 0644 "$BACKUP_DIR/telemt.service" "$SERVICE_FILE" || true
-  else
-    rm -f "$SERVICE_FILE" || true
+restore_previous_state() {
+  (( MUTATED == 1 && COMMITTED == 0 )) || return 0
+  warn "Ошибка тестовой миграции: откатываю состояние до Teleproxy-теста."
+
+  systemctl disable --now teleproxy >/dev/null 2>&1 || true
+  rm -rf "$TELEPROXY_CONFIG_DIR"
+  rm -f "$TELEPROXY_SERVICE" "$TELEPROXY_BINARY"
+
+  if [[ -d "$BACKUP_DIR/teleproxy-config" ]]; then
+    cp -a "$BACKUP_DIR/teleproxy-config" "$TELEPROXY_CONFIG_DIR"
   fi
+  [[ -f "$BACKUP_DIR/teleproxy.service" ]] && cp -a "$BACKUP_DIR/teleproxy.service" "$TELEPROXY_SERVICE"
+  [[ -f "$BACKUP_DIR/teleproxy.binary" ]] && cp -a "$BACKUP_DIR/teleproxy.binary" "$TELEPROXY_BINARY"
+
+  if [[ -d "$BACKUP_DIR/telemt-config" ]]; then
+    rm -rf "$TELEMT_CONFIG_DIR"
+    cp -a "$BACKUP_DIR/telemt-config" "$TELEMT_CONFIG_DIR"
+  fi
+  [[ -f "$BACKUP_DIR/telemt.service" ]] && cp -a "$BACKUP_DIR/telemt.service" "$TELEMT_SERVICE"
+  [[ -f "$BACKUP_DIR/telemt.binary" ]] && cp -a "$BACKUP_DIR/telemt.binary" "$TELEMT_BINARY"
+
+  [[ -f "$BACKUP_DIR/telemt-antidpi-mss.service" ]] && cp -a "$BACKUP_DIR/telemt-antidpi-mss.service" "$OLD_DPI_SERVICE"
+  [[ -f "$BACKUP_DIR/telemt-antidpi-mss.helper" ]] && cp -a "$BACKUP_DIR/telemt-antidpi-mss.helper" "$OLD_DPI_HELPER"
 
   systemctl daemon-reload >/dev/null 2>&1 || true
-  if (( HAD_OLD_SERVICE == 1 )); then
-    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
-    systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
+  if (( TELEMT_WAS_ACTIVE == 1 )); then
+    systemctl enable telemt >/dev/null 2>&1 || true
+    systemctl restart telemt >/dev/null 2>&1 || true
   fi
-  warn "Откат выполнен. Backup сохранён: $BACKUP_DIR"
+  if (( OLD_DPI_WAS_ACTIVE == 1 )); then
+    systemctl enable --now telemt-antidpi-mss.service >/dev/null 2>&1 || true
+  fi
+  warn "Откат завершён. Backup: $BACKUP_DIR"
 }
 
 on_error() {
   local exit_code=$?
-  local line="${1:-?}"
-  local command="${2:-unknown}"
-  printf '\033[1;31m[FAIL]\033[0m Ошибка на строке %s: %s\n' "$line" "$command" >&2
-  printf 'Журнал установки: %s\n' "$LOG_FILE" >&2
-  restore_previous_installation
+  printf '\033[1;31m[FAIL]\033[0m Ошибка на строке %s: %s\n' "${1:-?}" "${2:-unknown}" >&2
+  printf 'Лог: %s\n' "$LOG_FILE" >&2
+  restore_previous_state
   exit "$exit_code"
 }
 trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
 
-require_root() {
-  [[ "${EUID:-$(id -u)}" -eq 0 ]] || fail "Запустите от root: sudo bash $0"
-}
+stop_conflicting_services() {
+  remove_old_antidpi_rule
+  systemctl disable --now telemt >/dev/null 2>&1 || true
+  systemctl disable --now teleproxy >/dev/null 2>&1 || true
+  sleep 1
 
-validate_inputs() {
-  [[ "$PORT" =~ ^[0-9]+$ ]] || fail "PORT должен быть числом."
-  (( PORT >= 1 && PORT <= 65535 )) || fail "PORT должен быть в диапазоне 1..65535."
-  [[ "$ROTATE_SECRET" == "0" || "$ROTATE_SECRET" == "1" ]] ||
-    fail "ROTATE_SECRET допускает только 0 или 1."
-  [[ "$MSS" =~ ^[0-9]+$ ]] && (( MSS >= 64 && MSS <= 1460 )) ||
-    fail "MSS должен быть в диапазоне 64..1460."
-
-  local item allowed=0
-  for item in "${ALLOWED_SNI[@]}"; do
-    [[ "$SNI" == "$item" ]] && allowed=1
-  done
-  (( allowed == 1 )) ||
-    fail "Недопустимый SNI: ${SNI}. Разрешены: ${ALLOWED_SNI[*]}"
-}
-
-install_dependencies() {
-  [[ -r /etc/os-release ]] || fail "Не удалось определить ОС. Требуется Debian/Ubuntu."
-  # shellcheck source=/dev/null
-  source /etc/os-release
-  case "${ID:-}" in
-    ubuntu|debian) ;;
-    *) fail "Поддерживаются Debian/Ubuntu. Обнаружено: ${PRETTY_NAME:-unknown}." ;;
-  esac
-
-  info "Устанавливаю зависимости на ${PRETTY_NAME:-$ID}."
-  export DEBIAN_FRONTEND=noninteractive
-
-  # unattended-upgrades commonly owns dpkg locks immediately after a fresh VPS boot.
-  # Never remove lock files and never kill the updater: apt safely waits for it.
-  info "Ожидаю освобождения apt/dpkg lock до ${APT_LOCK_TIMEOUT_SECONDS} сек., если запущены фоновые обновления."
-  apt-get -o DPkg::Lock::Timeout="${APT_LOCK_TIMEOUT_SECONDS}" update -y
-  apt-get -o DPkg::Lock::Timeout="${APT_LOCK_TIMEOUT_SECONDS}" install -y --no-install-recommends \
-    ca-certificates curl openssl tar gzip iproute2 jq libcap2-bin iptables
-  ok "Зависимости установлены."
-}
-
-is_ipv4() {
-  local ip="$1"
-  awk -F. '
-    NF != 4 { exit 1 }
-    {
-      for (i = 1; i <= 4; i++) {
-        if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) exit 1
-      }
-    }
-  ' <<<"$ip"
-}
-
-detect_server_host() {
-  if [[ -n "$SERVER_HOST" ]]; then
-    printf '%s' "$SERVER_HOST"
-    return
-  fi
-
-  local ip
-  ip="$(curl -4fsS --retry 2 --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)"
-  ip="${ip//[[:space:]]/}"
-  [[ -n "$ip" ]] && is_ipv4 "$ip" ||
-    fail "Не удалось определить внешний IPv4. Используйте SERVER_HOST=ВАШ_IP."
-  printf '%s' "$ip"
-}
-
-backup_existing_installation() {
-  local stamp
-  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  BACKUP_DIR="${BACKUP_ROOT}/${stamp}"
-  mkdir -p "$BACKUP_DIR"
-
-  if [[ -x "$BINARY_PATH" ]]; then
-    cp -a "$BINARY_PATH" "$BACKUP_DIR/telemt.binary"
-    HAD_OLD_BINARY=1
-  fi
-  if [[ -f "$CONFIG_FILE" ]]; then
-    cp -a "$CONFIG_FILE" "$BACKUP_DIR/telemt.toml"
-    HAD_OLD_CONFIG=1
-  fi
-  if [[ -f "$SERVICE_FILE" ]]; then
-    cp -a "$SERVICE_FILE" "$BACKUP_DIR/telemt.service"
-    HAD_OLD_SERVICE=1
-  fi
-  [[ -f "$ANTIDPI_HELPER" ]] && cp -a "$ANTIDPI_HELPER" "$BACKUP_DIR/telemt-antidpi-mss.helper" || true
-  [[ -f "$ANTIDPI_UNIT" ]] && cp -a "$ANTIDPI_UNIT" "$BACKUP_DIR/telemt-antidpi-mss.service" || true
-
-  ok "Backup текущего состояния: $BACKUP_DIR"
-}
-
-ensure_port_can_be_reused() {
   local occupied
   occupied="$(ss -H -ltnp "sport = :${PORT}" 2>/dev/null || true)"
-  [[ -z "$occupied" ]] && return 0
-
-  if grep -q '"telemt"' <<<"$occupied"; then
-    info "Порт ${PORT}/tcp занят текущим telemt; сервис будет безопасно перезапущен."
-    return 0
-  fi
-
-  printf '%s\n' "$occupied" >&2
-  fail "Порт ${PORT}/tcp занят другим процессом. Освободите порт или выберите PORT=..."
+  [[ -z "$occupied" ]] || {
+    printf '%s\n' "$occupied" >&2
+    fail "TCP/${PORT} после остановки telemt/teleproxy занят другим процессом."
+  }
 }
 
-detect_asset_name() {
-  local arch libc
-  case "$(uname -m)" in
-    x86_64|amd64) arch="x86_64" ;;
-    aarch64|arm64) arch="aarch64" ;;
-    *) fail "Неподдерживаемая архитектура: $(uname -m)" ;;
-  esac
+install_teleproxy_from_official_installer() {
+  local installer
+  installer="$(mktemp /tmp/teleproxy-install.XXXXXX.sh)"
+  curl -fL --retry 3 --connect-timeout 15 --max-time 60 -o "$installer" "$INSTALLER_URL"
+  grep -q 'GITHUB_REPO="teleproxy/teleproxy"' "$installer" ||
+    fail "Загруженный installer Teleproxy не прошёл минимальную проверку происхождения."
 
-  if ldd --version 2>&1 | grep -qi musl; then
-    libc="musl"
-  else
-    libc="gnu"
-  fi
+  # Do not let official installer retain an older trial config.
+  rm -rf "$TELEPROXY_CONFIG_DIR"
 
-  printf 'telemt-%s-linux-%s.tar.gz' "$arch" "$libc"
+  info "Устанавливаю закреплённый Teleproxy v${TELEPROXY_VERSION}, Direct, Fake-TLS domain=${DOMAIN}."
+  env \
+    PORT="$PORT" \
+    STATS_PORT="$STATS_PORT" \
+    EE_DOMAIN="$DOMAIN" \
+    SECRET="$SECRET" \
+    TELEPROXY_VERSION="$TELEPROXY_VERSION" \
+    sh "$installer"
+  rm -f "$installer"
 }
 
-download_pinned_telemt() {
-  local asset url temp_dir archive extracted_binary
-  asset="$(detect_asset_name)"
-  url="https://github.com/telemt/telemt/releases/download/${TELEMT_VERSION}/${asset}"
-  temp_dir="$(mktemp -d /tmp/telemt-install.XXXXXX)"
-  archive="${temp_dir}/${asset}"
+verify_teleproxy() {
+  systemctl is-active --quiet teleproxy ||
+    fail "teleproxy.service не active после установки."
 
-  info "Скачиваю строго закреплённый Telemt ${TELEMT_VERSION}: ${asset}"
-  curl -fL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 180 \
-    -o "$archive" "$url"
+  ss -H -ltnp "sport = :${PORT}" 2>/dev/null | grep -q ":${PORT}" ||
+    fail "Teleproxy не слушает TCP/${PORT}."
 
-  tar -xzf "$archive" -C "$temp_dir"
-  extracted_binary="$(find "$temp_dir" -type f -name telemt -print -quit)"
-  [[ -n "$extracted_binary" ]] || fail "Бинарник telemt отсутствует в официальном архиве."
+  [[ -f "$TELEPROXY_CONFIG_DIR/config.toml" ]] ||
+    fail "Не создан конфиг Teleproxy."
 
-  install -m 0755 "$extracted_binary" "$BINARY_PATH"
-  rm -rf "$temp_dir"
+  grep -Eq '^direct[[:space:]]*=[[:space:]]*true' "$TELEPROXY_CONFIG_DIR/config.toml" ||
+    fail "В конфиге Teleproxy отсутствует direct=true."
+  grep -Eq "^domain[[:space:]]*=[[:space:]]*\"${DOMAIN}\"" "$TELEPROXY_CONFIG_DIR/config.toml" ||
+    fail "В конфиге Teleproxy отсутствует Fake-TLS domain=${DOMAIN}."
 
-  "$BINARY_PATH" --version 2>/dev/null || true
-  ok "Telemt ${TELEMT_VERSION} установлен: $BINARY_PATH"
+  ok "Teleproxy active: Direct-to-DC + Fake-TLS ${DOMAIN} на TCP/${PORT}."
+  info "Teleproxy v4.14.1 включает automatic ClientHello fragmentation по умолчанию; отдельное старое TCPMSS-правило не используется."
 }
-
-ensure_service_user() {
-  if ! getent group telemt >/dev/null 2>&1; then
-    groupadd --system telemt
-  fi
-  if ! id -u telemt >/dev/null 2>&1; then
-    useradd --system --gid telemt --home-dir "$WORK_DIR" --create-home \
-      --shell /usr/sbin/nologin --comment "Telemt Proxy" telemt
-  fi
-
-  mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$TLS_FRONT_DIR" "$WORK_DIR"
-  chown root:telemt "$CONFIG_DIR"
-  chmod 0750 "$CONFIG_DIR"
-  chown -R telemt:telemt "$DATA_DIR" "$WORK_DIR"
-  chmod 0750 "$DATA_DIR" "$TLS_FRONT_DIR" "$WORK_DIR"
-}
-
-load_or_generate_secret() {
-  if [[ "$ROTATE_SECRET" == "0" && -f "$STATE_FILE" ]]; then
-    # shellcheck source=/dev/null
-    source "$STATE_FILE"
-    if [[ "${SECRET:-}" =~ ^[0-9a-fA-F]{32}$ ]]; then
-      SECRET="${SECRET,,}"
-      ok "Сохранён существующий secret пользователя ${USERNAME}."
-      return
-    fi
-  fi
-
-  if [[ "$ROTATE_SECRET" == "0" && -f "$CONFIG_FILE" ]]; then
-    SECRET="$(awk -F'"' -v user="$USERNAME" '$1 ~ "^[[:space:]]*" user "[[:space:]]*=" {print $2; exit}' "$CONFIG_FILE" || true)"
-    if [[ "$SECRET" =~ ^[0-9a-fA-F]{32}$ ]]; then
-      SECRET="${SECRET,,}"
-      ok "Secret извлечён из существующего Direct-конфига."
-      return
-    fi
-  fi
-
-  SECRET="$(openssl rand -hex 16)"
-  [[ "$SECRET" =~ ^[0-9a-f]{32}$ ]] || fail "Не удалось сгенерировать корректный secret."
-  ok "Создан новый secret пользователя ${USERNAME}."
-}
-
-write_direct_config() {
-  cat > "$CONFIG_FILE" <<EOF
-# Generated by mtproto-telemt-direct-antidpi-v${INSTALLER_VERSION}.sh
-# Baseline: Telegram client -> VPS -> Telegram DC directly.
-# Middle Proxy, sponsor/ad_tag and automatic Cascade are intentionally absent.
-
-[general]
-use_middle_proxy = false
-fast_mode = true
-log_level = "normal"
-disable_colors = true
-
-[general.modes]
-classic = false
-secure = false
-tls = true
-
-[general.links]
-show = "*"
-public_host = "${SERVER_HOST}"
-public_port = ${PORT}
-
-[server]
-port = ${PORT}
-max_connections = 10000
-
-[server.api]
-enabled = true
-listen = "127.0.0.1:9091"
-whitelist = ["127.0.0.1/32", "::1/128"]
-minimal_runtime_enabled = false
-minimal_runtime_cache_ttl_ms = 1000
-
-[[server.listeners]]
-ip = "0.0.0.0"
-
-[censorship]
-tls_domain = "${SNI}"
-mask = true
-tls_emulation = true
-tls_front_dir = "${TLS_FRONT_DIR}"
-
-[access.users]
-${USERNAME} = "${SECRET}"
-EOF
-
-  chown root:telemt "$CONFIG_FILE"
-  chmod 0640 "$CONFIG_FILE"
-
-  cat > "$STATE_FILE" <<EOF
-SECRET='${SECRET}'
-SNI='${SNI}'
-SERVER_HOST='${SERVER_HOST}'
-PORT='${PORT}'
-TELEMT_VERSION='${TELEMT_VERSION}'
-EOF
-  chown root:root "$STATE_FILE"
-  chmod 0600 "$STATE_FILE"
-
-  ok "Direct-конфиг создан: use_middle_proxy=false, Fake TLS SNI=${SNI}, TCP/${PORT}."
-}
-
-write_systemd_unit() {
-  cat > "$SERVICE_FILE" <<EOF
-[Unit]
-Description=Telemt MTProto Proxy Direct Fake TLS (${SNI})
-Documentation=https://github.com/telemt/telemt
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=telemt
-Group=telemt
-WorkingDirectory=${DATA_DIR}
-ExecStart=${BINARY_PATH} ${CONFIG_FILE}
-Restart=on-failure
-RestartSec=3
-LimitNOFILE=65536
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=${DATA_DIR}
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  chmod 0644 "$SERVICE_FILE"
-  systemctl daemon-reload
-  systemctl enable "$SERVICE_NAME" >/dev/null
-}
-
-allow_ufw_port_when_active() {
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-    ufw allow "${PORT}/tcp" >/dev/null
-    ok "UFW: открыт входящий TCP/${PORT}."
-  else
-    info "UFW не активен; локальные правила firewall не изменялись."
-  fi
-}
-
-start_and_wait_for_listener() {
-  local elapsed=0
-  systemctl restart "$SERVICE_NAME"
-
-  info "Ожидаю listener TCP/${PORT}; Direct DC probe Telemt может занять больше 30 секунд."
-  while (( elapsed < STARTUP_TIMEOUT_SECONDS )); do
-    if ! systemctl is-active --quiet "$SERVICE_NAME"; then
-      journalctl -u "$SERVICE_NAME" -n 120 --no-pager || true
-      fail "Сервис telemt завершился до появления listener."
-    fi
-
-    if ss -H -ltn "sport = :${PORT}" 2>/dev/null | grep -q ":${PORT}"; then
-      ok "Telemt слушает TCP/${PORT} через ${elapsed} сек."
-      return
-    fi
-
-    sleep 2
-    elapsed=$((elapsed + 2))
-    if (( elapsed % 10 == 0 )); then
-      info "Инициализация Telemt: прошло ${elapsed}/${STARTUP_TIMEOUT_SECONDS} сек..."
-    fi
-  done
-
-  journalctl -u "$SERVICE_NAME" -n 160 --no-pager || true
-  fail "Telemt не открыл TCP/${PORT} за ${STARTUP_TIMEOUT_SECONDS} секунд."
-}
-
-probe_runtime_status() {
-  local ready_response http_code
-  http_code="$(
-    curl -sS -o /tmp/telemt-health-ready.json -w '%{http_code}' \
-      --connect-timeout 3 --max-time 5 http://127.0.0.1:9091/v1/health/ready || true
-  )"
-  ready_response="$(cat /tmp/telemt-health-ready.json 2>/dev/null || true)"
-  rm -f /tmp/telemt-health-ready.json
-
-  if [[ "$http_code" == "200" ]]; then
-    ok "Runtime readiness API: HTTP 200."
-  else
-    warn "Listener поднят, но /v1/health/ready вернул HTTP ${http_code:-n/a}; это требует проверки Telegram-клиентом."
-  fi
-  [[ -n "$ready_response" ]] && printf 'Runtime response: %s\n' "$ready_response"
-
-  if journalctl -u "$SERVICE_NAME" -n 160 --no-pager 2>/dev/null | grep -q 'No DC connectivity'; then
-    warn "Лог Telemt содержит 'No DC connectivity via direct': listener жив, но серверный DC-probe деградирован."
-  fi
-}
-
-verify_direct_runtime() {
-  local gates quality route middle healthy direct
-  gates="$(curl -fsS --connect-timeout 3 --max-time 5 http://127.0.0.1:9091/v1/runtime/gates)"
-  quality="$(curl -fsS --connect-timeout 3 --max-time 5 http://127.0.0.1:9091/v1/runtime/upstream_quality)"
-
-  route="$(jq -r 'if .data.route_mode == null then "unknown" else .data.route_mode end' <<<"$gates")"
-
-  # Boolean false is the required healthy Direct-only value.
-  # Do not use `.data.use_middle_proxy // empty`: jq treats false as fallback.
-  middle="$(jq -r 'if (.data | has("use_middle_proxy")) then (.data.use_middle_proxy | tostring) else "unknown" end' <<<"$gates")"
-
-  healthy="$(jq -r '.data.summary.healthy_total // 0' <<<"$quality")"
-  direct="$(jq -r '.data.summary.direct_total // 0' <<<"$quality")"
-
-  [[ "$route" == "direct" && "$middle" == "false" ]] ||
-    fail "Telemt не в Direct-only режиме: route_mode=${route}, use_middle_proxy=${middle}."
-  (( healthy >= 1 && direct >= 1 )) ||
-    fail "Telemt Direct upstream не healthy: healthy_total=${healthy}, direct_total=${direct}."
-
-  ok "Direct baseline подтверждён API: route_mode=direct, use_middle_proxy=false, healthy_direct_upstreams=${healthy}."
-}
-
-write_antidpi_helper() {
-  cat > "$ANTIDPI_HELPER" <<EOF
-#!/usr/bin/env bash
-set -Eeuo pipefail
-
-PORT="\${PORT:-${PORT}}"
-MSS="\${MSS:-${MSS}}"
-CHAIN="TELEMT_ANTIDPI_MSS"
-
-apply_family() {
-  local cmd="\$1"
-  "\$cmd" -w 10 -t mangle -N "\$CHAIN" 2>/dev/null || true
-  "\$cmd" -w 10 -t mangle -F "\$CHAIN"
-  "\$cmd" -w 10 -t mangle -A "\$CHAIN" \
-    -p tcp --sport "\$PORT" --tcp-flags SYN,RST SYN \
-    -j TCPMSS --set-mss "\$MSS"
-  "\$cmd" -w 10 -t mangle -C OUTPUT -j "\$CHAIN" >/dev/null 2>&1 ||
-    "\$cmd" -w 10 -t mangle -I OUTPUT 1 -j "\$CHAIN"
-}
-
-remove_family() {
-  local cmd="\$1"
-  while "\$cmd" -w 10 -t mangle -C OUTPUT -j "\$CHAIN" >/dev/null 2>&1; do
-    "\$cmd" -w 10 -t mangle -D OUTPUT -j "\$CHAIN"
-  done
-  "\$cmd" -w 10 -t mangle -F "\$CHAIN" >/dev/null 2>&1 || true
-  "\$cmd" -w 10 -t mangle -X "\$CHAIN" >/dev/null 2>&1 || true
-}
-
-status_family() {
-  local label="\$1" cmd="\$2"
-  printf '\n--- %s ---\n' "\$label"
-  "\$cmd" -w 10 -t mangle -L "\$CHAIN" -n -v --line-numbers 2>&1 || echo "rule absent"
-}
-
-case "\${1:-apply}" in
-  apply)
-    apply_family iptables
-    if command -v ip6tables >/dev/null 2>&1; then
-      apply_family ip6tables
-    fi
-    ;;
-  remove)
-    remove_family iptables
-    if command -v ip6tables >/dev/null 2>&1; then
-      remove_family ip6tables
-    fi
-    ;;
-  status)
-    status_family "IPv4 OUTPUT / TCPMSS" iptables
-    if command -v ip6tables >/dev/null 2>&1; then
-      status_family "IPv6 OUTPUT / TCPMSS" ip6tables
-    fi
-    ;;
-  *)
-    echo "Usage: \$0 apply|remove|status" >&2
-    exit 2
-    ;;
-esac
-EOF
-  chmod 0755 "$ANTIDPI_HELPER"
-}
-
-enable_antidpi_mss() {
-  write_antidpi_helper
-
-  cat > "$ANTIDPI_UNIT" <<EOF
-[Unit]
-Description=Telemt inbound anti-DPI TCPMSS fragmentation (TCP/${PORT}, MSS=${MSS})
-After=network-pre.target
-Before=telemt.service
-Wants=network-pre.target
-
-[Service]
-Type=oneshot
-ExecStart=${ANTIDPI_HELPER} apply
-ExecStop=${ANTIDPI_HELPER} remove
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  chmod 0644 "$ANTIDPI_UNIT"
-  systemctl daemon-reload
-  systemctl enable "$ANTIDPI_SERVICE" >/dev/null
-  if ! systemctl restart "$ANTIDPI_SERVICE"; then
-    systemctl status "$ANTIDPI_SERVICE" --no-pager -l || true
-    fail "Не удалось применить anti-DPI TCPMSS правило."
-  fi
-
-  "$ANTIDPI_HELPER" status
-  ok "Anti-DPI включён: новые клиентские TCP-сеансы к ${PORT}/tcp получают TCPMSS=${MSS}."
-  info "Direct egress Telemt → Telegram DC не менялся."
-}
-
 
 hex_encode() {
   printf '%s' "$1" | od -An -tx1 | tr -d ' \n'
 }
 
-base64url_from_hex() {
-  local hex="$1" escaped="" i
-  [[ "$hex" =~ ^([0-9a-fA-F]{2})+$ ]] || fail "Внутренняя ошибка: некорректный HEX для Base64URL-ссылки."
-  for ((i = 0; i < ${#hex}; i += 2)); do
-    escaped+="\\x${hex:i:2}"
-  done
-  printf '%b' "$escaped" | base64 -w 0 | tr '+/' '-_' | tr -d '='
+public_ipv4() {
+  curl -4fsS --connect-timeout 5 --max-time 10 https://api.ipify.org | tr -d '[:space:]'
 }
 
-save_connection_link() {
-  local raw_tls_hex tls_secret_base64url api_link compatibility_link
-  raw_tls_hex="ee${SECRET}$(hex_encode "$SNI")"
-  tls_secret_base64url="$(base64url_from_hex "$raw_tls_hex")"
-  compatibility_link="tg://proxy?server=${SERVER_HOST}&port=${PORT}&secret=${tls_secret_base64url}"
-
-  api_link="$(
-    curl -fsS --connect-timeout 3 --max-time 5 http://127.0.0.1:9091/v1/users |
-      jq -r --arg username "$USERNAME" '.data[] | select(.username == $username) | .links.tls[0] // empty' |
-      head -n 1
-  )"
-  [[ -n "$api_link" && "$api_link" == tg://proxy* ]] ||
-    fail "Telemt API не вернул TLS-ссылку пользователя ${USERNAME}."
+save_link() {
+  local ip tls_secret link
+  ip="$(public_ipv4)"
+  tls_secret="ee${SECRET,,}$(hex_encode "$DOMAIN")"
+  link="tg://proxy?server=${ip}&port=${PORT}&secret=${tls_secret}"
 
   cat > "$LINK_FILE" <<EOF
-Telemt ${TELEMT_VERSION} — Direct + Fake TLS + inbound anti-DPI TCPMSS
-Server: ${SERVER_HOST}
+Teleproxy v${TELEPROXY_VERSION} — Direct-to-DC Fake-TLS DPI-hardening test
+Server: ${ip}
 Port: ${PORT}
-SNI: ${SNI}
-Middle Proxy: disabled
-Cascade: not configured
-Anti-DPI: TCPMSS=${MSS} on new inbound client sessions
-
-Official Telemt API TLS link:
-${api_link}
-
-Equivalent Base64URL EE-TLS link:
-${compatibility_link}
+Domain: ${DOMAIN}
+Direct: true
+Link:
+${link}
 EOF
-  chmod 0600 "$LINK_FILE"
+  chmod 600 "$LINK_FILE"
 
   printf '\n====================================================================\n'
-  printf ' TELEMT DIRECT + FAKE TLS + ANTI-DPI УСТАНОВЛЕН\n'
+  printf ' TELEPROXY DIRECT DPI-HARDENING A/B TEST УСТАНОВЛЕН\n'
   printf '====================================================================\n'
-  printf 'Telemt:   %s (pinned)\n' "$TELEMT_VERSION"
-  printf 'Маршрут:  Telegram client -> anti-DPI MSS -> VPS -> Telegram DC (Direct)\n'
-  printf 'SNI:      %s\n' "$SNI"
-  printf 'Порт:     %s/tcp\n' "$PORT"
-  printf 'Anti-DPI: TCPMSS=%s для новых клиентских соединений\n' "$MSS"
-  printf '\nОфициальная ссылка из API Telemt:\n%s\n\n' "$api_link"
-  printf 'Base64URL-эквивалент:\n%s\n\n' "$compatibility_link"
-  printf 'Сохранено: %s\n' "$LINK_FILE"
-  printf 'Telemt:    journalctl -u telemt -n 150 --no-pager\n'
-  printf 'Anti-DPI:  %s status\n' "$ANTIDPI_HELPER"
-  printf 'Откат DPI: %s remove\n' "$ANTIDPI_HELPER"
-  printf 'Backup:    %s\n' "$BACKUP_DIR"
-  printf '\nСейчас выключи WARP на телефоне и переподключи этот proxy: правило\n'
-  printf 'применяется только к новым TCP-соединениям. Затем проверь счётчик:\n'
-  printf '  sudo %s status\n' "$ANTIDPI_HELPER"
+  printf 'Engine:   Teleproxy v%s (pinned)\n' "$TELEPROXY_VERSION"
+  printf 'Route:    Client -> Teleproxy -> Telegram DC (Direct)\n'
+  printf 'Fake-TLS: %s\n' "$DOMAIN"
+  printf 'Link:\n%s\n\n' "$link"
+  printf 'Saved:    %s\n' "$LINK_FILE"
+  printf 'Logs:     journalctl -u teleproxy -n 150 --no-pager\n'
+  printf 'Config:   %s/config.toml\n' "$TELEPROXY_CONFIG_DIR"
+  printf 'Backup:   %s\n' "$BACKUP_DIR"
+  printf '\nЭто A/B-тест другого входного движка. Выключи WARP на клиенте,\n'
+  printf 'удали старую MTProxy-запись и подключи именно новую ссылку.\n'
   printf '====================================================================\n'
 }
 
@@ -642,29 +318,22 @@ main() {
   require_root
   validate_inputs
 
-  info "Installer v${INSTALLER_VERSION}: Telemt ${TELEMT_VERSION}, Direct + Fake TLS + inbound anti-DPI, SNI=${SNI}, MSS=${MSS}."
-  install_dependencies
-  SERVER_HOST="$(detect_server_host)"
-  ok "Публичный адрес для Telegram-ссылки: ${SERVER_HOST}"
+  if [[ "$ACTION" == "restore" ]]; then
+    restore_from_backup
+    return 0
+  fi
 
-  ensure_port_can_be_reused
-  backup_existing_installation
-  MUTATION_STARTED=1
+  command -v curl >/dev/null 2>&1 || fail "Нужен curl."
+  command -v ss >/dev/null 2>&1 || fail "Нужен ss (iproute2)."
+  command -v openssl >/dev/null 2>&1 || fail "Нужен openssl для генерации secret."
 
-  ensure_service_user
-  load_or_generate_secret
-  systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
-  download_pinned_telemt
-  write_direct_config
-  write_systemd_unit
-  allow_ufw_port_when_active
-  start_and_wait_for_listener
-  probe_runtime_status
-  verify_direct_runtime
-
+  backup_existing_state
+  MUTATED=1
+  stop_conflicting_services
+  install_teleproxy_from_official_installer
+  verify_teleproxy
+  save_link
   COMMITTED=1
-  enable_antidpi_mss
-  save_connection_link
 }
 
 main "$@"
