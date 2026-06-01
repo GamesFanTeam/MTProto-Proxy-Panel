@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Telemt Direct + Fake TLS + inbound anti-DPI one-click installer
-# Version: 1.4 — full Telemt installation plus TCPMSS ClientHello fragmentation
+# Version: 1.5 — fix Direct boolean verification plus TCPMSS ClientHello fragmentation
 #
 # Baseline route:
 #   Telegram client -> VPS:443 -> Telemt -> Telegram DC (Direct)
@@ -16,17 +16,17 @@
 #   - Output includes the official Telemt API TLS link and an equivalent Base64URL form.
 #
 # Run:
-#   sudo bash ./mtproto-telemt-direct-antidpi-v1.4.sh
+#   sudo bash ./mtproto-telemt-direct-antidpi-v1.5.sh
 #
 # Optional:
-#   SNI=vk.com sudo -E bash ./mtproto-telemt-direct-antidpi-v1.4.sh
-#   MSS=88 PORT=443 SERVER_HOST=proxy.example.com sudo -E bash ./mtproto-telemt-direct-antidpi-v1.4.sh
-#   ROTATE_SECRET=1 sudo -E bash ./mtproto-telemt-direct-antidpi-v1.4.sh
+#   SNI=vk.com sudo -E bash ./mtproto-telemt-direct-antidpi-v1.5.sh
+#   MSS=88 PORT=443 SERVER_HOST=proxy.example.com sudo -E bash ./mtproto-telemt-direct-antidpi-v1.5.sh
+#   ROTATE_SECRET=1 sudo -E bash ./mtproto-telemt-direct-antidpi-v1.5.sh
 
 set -Eeuo pipefail
 umask 077
 
-readonly INSTALLER_VERSION="1.4"
+readonly INSTALLER_VERSION="1.5"
 readonly TELEMT_VERSION="3.4.13"
 readonly SERVICE_NAME="telemt"
 readonly USERNAME="main"
@@ -459,17 +459,21 @@ verify_direct_runtime() {
   gates="$(curl -fsS --connect-timeout 3 --max-time 5 http://127.0.0.1:9091/v1/runtime/gates)"
   quality="$(curl -fsS --connect-timeout 3 --max-time 5 http://127.0.0.1:9091/v1/runtime/upstream_quality)"
 
-  route="$(jq -r '.data.route_mode // empty' <<<"$gates")"
-  middle="$(jq -r '.data.use_middle_proxy // empty' <<<"$gates")"
+  route="$(jq -r 'if .data.route_mode == null then "unknown" else .data.route_mode end' <<<"$gates")"
+
+  # Boolean false is the required healthy Direct-only value.
+  # Do not use `.data.use_middle_proxy // empty`: jq treats false as fallback.
+  middle="$(jq -r 'if (.data | has("use_middle_proxy")) then (.data.use_middle_proxy | tostring) else "unknown" end' <<<"$gates")"
+
   healthy="$(jq -r '.data.summary.healthy_total // 0' <<<"$quality")"
   direct="$(jq -r '.data.summary.direct_total // 0' <<<"$quality")"
 
   [[ "$route" == "direct" && "$middle" == "false" ]] ||
-    fail "Telemt не в Direct-only режиме: route_mode=${route:-unknown}, use_middle_proxy=${middle:-unknown}."
+    fail "Telemt не в Direct-only режиме: route_mode=${route}, use_middle_proxy=${middle}."
   (( healthy >= 1 && direct >= 1 )) ||
     fail "Telemt Direct upstream не healthy: healthy_total=${healthy}, direct_total=${direct}."
 
-  ok "Direct baseline подтверждён API: route_mode=direct, healthy_direct_upstreams=${healthy}."
+  ok "Direct baseline подтверждён API: route_mode=direct, use_middle_proxy=false, healthy_direct_upstreams=${healthy}."
 }
 
 write_antidpi_helper() {
