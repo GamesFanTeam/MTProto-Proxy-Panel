@@ -2,263 +2,319 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly TELEMT_VERSION="3.4.13"
+# Teleproxy MTProto Fake-TLS installer
+# Project: https://github.com/teleproxy/teleproxy
+# Installs pinned Teleproxy v4.14.1 in direct mode with Fake-TLS SNI vk.com.
+
+readonly TELEPROXY_VERSION="4.14.1"
 readonly SNI_DOMAIN="vk.com"
 readonly DEFAULT_PORT="443"
-readonly BIN_PATH="/usr/local/bin/telemt"
-readonly CONFIG_DIR="/etc/telemt"
-readonly CONFIG_FILE="${CONFIG_DIR}/telemt.toml"
-readonly WORK_DIR="/opt/telemt"
-readonly SERVICE_FILE="/etc/systemd/system/telemt.service"
-readonly SERVICE_NAME="telemt"
+readonly STATS_PORT="8888"
+readonly UPSTREAM_INSTALLER_URL="https://raw.githubusercontent.com/teleproxy/teleproxy/v${TELEPROXY_VERSION}/install.sh"
+readonly CONFIG_FILE="/etc/teleproxy/config.toml"
+readonly SERVICE_NAME="teleproxy"
+readonly BACKUP_ROOT="/root/teleproxy-installer-backups"
 
 PUBLIC_HOST=""
-SERVER_PORT="${DEFAULT_PORT}"
-PORT_PROVIDED=0
+PROXY_PORT="$DEFAULT_PORT"
+REPLACE_EXISTING=0
+BACKUP_DIR=""
+WAS_ACTIVE=0
+UPSTREAM_INSTALLER=""
 
-log() { printf '\033[1;34m[INFO]\033[0m %s\n' "$*"; }
-ok()  { printf '\033[1;32m[ OK ]\033[0m %s\n' "$*"; }
-warn(){ printf '\033[1;33m[WARN]\033[0m %s\n' "$*" >&2; }
-die() { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
-
-on_error() {
-  local line="$1"
-  warn "Установка остановлена на строке ${line}."
-  if command -v systemctl >/dev/null 2>&1 && systemctl cat "${SERVICE_NAME}" >/dev/null 2>&1; then
-    warn "Последние логи: journalctl -u ${SERVICE_NAME} -n 80 --no-pager"
-  fi
-}
-trap 'on_error "$LINENO"' ERR
+log()  { printf '\033[1;32m[OK]\033[0m %s\n' "$*"; }
+info() { printf '\033[1;34m[INFO]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<EOF
-Установка Telemt ${TELEMT_VERSION}: Direct MTProto + Fake TLS, SNI ${SNI_DOMAIN}.
-
 Использование:
-  sudo bash $0
-  sudo bash $0 --host proxy.example.com --port 443
+  sudo ./teleproxy-faketls-vk-install.sh
+  sudo ./teleproxy-faketls-vk-install.sh --host proxy.example.com --port 443
+  sudo ./teleproxy-faketls-vk-install.sh --replace --host proxy.example.com
 
-Опции:
-  --host HOST   Публичный домен или IPv4 VPS для Telegram-ссылки.
-  --port PORT   TCP-порт proxy, по умолчанию ${DEFAULT_PORT}.
-  -h, --help    Показать помощь.
+Параметры:
+  --host HOST     Публичный домен или IPv4 VPS для Telegram-ссылки
+  --port PORT     TCP-порт прокси, по умолчанию: ${DEFAULT_PORT}
+  --replace       Заменить существующую конфигурацию Teleproxy новым secret
+  -h, --help      Показать эту справку
+
+Фиксированные настройки:
+  Teleproxy:      v${TELEPROXY_VERSION}
+  Fake-TLS SNI:   ${SNI_DOMAIN}
+  Режим:          direct-to-DC
 EOF
 }
 
-while (( $# > 0 )); do
-  case "$1" in
-    --host)
-      [[ $# -ge 2 ]] || die "После --host требуется домен или IPv4."
-      PUBLIC_HOST="$2"; shift 2 ;;
-    --port)
-      [[ $# -ge 2 ]] || die "После --port требуется число."
-      SERVER_PORT="$2"; PORT_PROVIDED=1; shift 2 ;;
-    -h|--help) usage; exit 0 ;;
-    *) die "Неизвестный аргумент: $1" ;;
-  esac
-done
-
-[[ "${EUID}" -eq 0 ]] || die "Запустите скрипт от root: sudo bash $0"
-[[ -d /run/systemd/system ]] || die "Этот простой скрипт рассчитан на Ubuntu/Debian с systemd."
-
-if [[ -r /etc/os-release ]]; then
-  # shellcheck disable=SC1091
-  source /etc/os-release
-  case "${ID:-}" in
-    ubuntu|debian) ;;
-    *) warn "Система ${PRETTY_NAME:-unknown} не проверена; скрипт ориентирован на Ubuntu/Debian." ;;
-  esac
-fi
-
-validate_host() {
-  [[ "$1" =~ ^[A-Za-z0-9.-]+$ ]] && [[ "$1" != -* ]] && [[ "$1" != *..* ]]
-}
-
-validate_port() {
-  [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
-}
-
-while [[ -z "${PUBLIC_HOST}" ]]; do
-  read -r -p "Публичный домен или IPv4 вашего VPS для ссылки Telegram: " PUBLIC_HOST </dev/tty
-  [[ -n "${PUBLIC_HOST}" ]] || warn "Значение не может быть пустым."
-done
-validate_host "${PUBLIC_HOST}" || die "HOST должен быть доменом или IPv4 без http://, пути и пробелов."
-
-if (( PORT_PROVIDED == 0 )); then
-  read -r -p "Порт Telemt [${DEFAULT_PORT}]: " INPUT_PORT </dev/tty || true
-  [[ -z "${INPUT_PORT:-}" ]] || SERVER_PORT="${INPUT_PORT}"
-fi
-validate_port "${SERVER_PORT}" || die "Порт должен быть числом от 1 до 65535."
-
-printf '\nПараметры установки:\n'
-printf '  Telemt:      %s\n' "${TELEMT_VERSION}"
-printf '  Public host: %s\n' "${PUBLIC_HOST}"
-printf '  Port:        %s\n' "${SERVER_PORT}"
-printf '  Mode:        Direct + Fake TLS only\n'
-printf '  SNI:         %s (фиксирован)\n\n' "${SNI_DOMAIN}"
-
-log "Установка зависимостей..."
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq ca-certificates curl openssl jq tar gzip iproute2 libcap2-bin >/dev/null
-
-case "$(uname -m)" in
-  x86_64)
-    ARCHIVE="telemt-x86_64-linux-gnu.tar.gz"
-    ARCHIVE_SHA256="48a92a07ae0e10a756222131416b604532500e0f2ab4d06bc7a898fe5f4c4cd3"
-    ;;
-  aarch64|arm64)
-    ARCHIVE="telemt-aarch64-linux-gnu.tar.gz"
-    ARCHIVE_SHA256="7c0e8c15242c5d960eefe36b930063b0c454f19e50f5fe5b9b48f947912a456a"
-    ;;
-  *) die "Архитектура $(uname -m) не поддержана этим скриптом (нужна x86_64 или aarch64)." ;;
-esac
-
-BACKUP_DIR="/var/backups/telemt-simple/$(date +%Y%m%d-%H%M%S)"
-if [[ -e "${CONFIG_FILE}" || -e "${SERVICE_FILE}" || -e "${BIN_PATH}" ]]; then
-  log "Создание резервной копии существующей установки: ${BACKUP_DIR}"
-  mkdir -p "${BACKUP_DIR}"
-  [[ -e "${CONFIG_FILE}" ]] && cp -a "${CONFIG_FILE}" "${BACKUP_DIR}/telemt.toml" || true
-  [[ -e "${SERVICE_FILE}" ]] && cp -a "${SERVICE_FILE}" "${BACKUP_DIR}/telemt.service" || true
-  [[ -e "${BIN_PATH}" ]] && cp -a "${BIN_PATH}" "${BACKUP_DIR}/telemt" || true
-fi
-
-systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
-if ss -H -ltn | awk -v suffix=":${SERVER_PORT}" '$4 ~ (suffix "$" ) { found=1 } END { exit !found }'; then
-  die "TCP-порт ${SERVER_PORT} уже занят другим сервисом. Освободите порт и запустите скрипт снова."
-fi
-
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "${TMP_DIR}"' EXIT
-DOWNLOAD_URL="https://github.com/telemt/telemt/releases/download/${TELEMT_VERSION}/${ARCHIVE}"
-log "Загрузка Telemt ${TELEMT_VERSION} (${ARCHIVE})..."
-curl --fail --location --retry 3 --connect-timeout 15 --output "${TMP_DIR}/${ARCHIVE}" "${DOWNLOAD_URL}"
-printf '%s  %s\n' "${ARCHIVE_SHA256}" "${TMP_DIR}/${ARCHIVE}" | sha256sum --check --status \
-  || die "SHA-256 архива Telemt не совпал. Установка прервана."
-ok "SHA-256 архива проверен."
-
-tar -xzf "${TMP_DIR}/${ARCHIVE}" -C "${TMP_DIR}"
-EXTRACTED_BIN="$(find "${TMP_DIR}" -type f -name telemt -perm -u+x -print -quit)"
-[[ -n "${EXTRACTED_BIN}" ]] || die "В архиве не найден исполняемый файл telemt."
-
-log "Создание системного пользователя и директорий..."
-getent group telemt >/dev/null || groupadd --system telemt
-id -u telemt >/dev/null 2>&1 || useradd --system --gid telemt --home-dir "${WORK_DIR}" --shell /usr/sbin/nologin --comment "Telemt Proxy" telemt
-mkdir -p "${CONFIG_DIR}" "${WORK_DIR}/tlsfront"
-chown root:telemt "${CONFIG_DIR}"
-chmod 750 "${CONFIG_DIR}"
-chown -R telemt:telemt "${WORK_DIR}"
-chmod 750 "${WORK_DIR}" "${WORK_DIR}/tlsfront"
-install -m 0755 "${EXTRACTED_BIN}" "${BIN_PATH}"
-
-USER_SECRET="$(openssl rand -hex 16)"
-[[ "${#USER_SECRET}" -eq 32 ]] || die "Не удалось сгенерировать пользовательский secret."
-
-log "Создание Direct-конфига Fake TLS с SNI ${SNI_DOMAIN}..."
-cat > "${CONFIG_FILE}" <<EOF
-[general]
-use_middle_proxy = false
-log_level = "normal"
-
-[general.modes]
-classic = false
-secure = false
-tls = true
-
-[general.links]
-show = "*"
-public_host = "${PUBLIC_HOST}"
-public_port = ${SERVER_PORT}
-
-[server]
-port = ${SERVER_PORT}
-
-[server.api]
-enabled = true
-listen = "127.0.0.1:9091"
-whitelist = ["127.0.0.1/32", "::1/128"]
-minimal_runtime_enabled = false
-minimal_runtime_cache_ttl_ms = 1000
-
-[[server.listeners]]
-ip = "0.0.0.0"
-
-[censorship]
-tls_domain = "${SNI_DOMAIN}"
-mask = true
-tls_emulation = true
-tls_front_dir = "tlsfront"
-
-[access.users]
-default = "${USER_SECRET}"
-EOF
-chown root:telemt "${CONFIG_FILE}"
-chmod 640 "${CONFIG_FILE}"
-
-cat > "${SERVICE_FILE}" <<EOF
-[Unit]
-Description=Telemt MTProto Proxy (Direct + Fake TLS ${SNI_DOMAIN})
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=telemt
-Group=telemt
-WorkingDirectory=${WORK_DIR}
-ExecStart=${BIN_PATH} ${CONFIG_FILE}
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=65536
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-chmod 644 "${SERVICE_FILE}"
-
-if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-  log "UFW активен: открываю ${SERVER_PORT}/tcp..."
-  ufw allow "${SERVER_PORT}/tcp" comment 'Telemt MTProto' >/dev/null
-else
-  warn "UFW не активен. Убедитесь, что порт ${SERVER_PORT}/tcp открыт в firewall VPS/облачной панели."
-fi
-
-log "Запуск telemt. Первичная Fake TLS/Direct инициализация может занять до 90 секунд..."
-systemctl daemon-reload
-systemctl enable --now "${SERVICE_NAME}" >/dev/null
-
-LINK=""
-for (( attempt=1; attempt<=90; attempt++ )); do
-  if ! systemctl is-active --quiet "${SERVICE_NAME}"; then
-    journalctl -u "${SERVICE_NAME}" -n 80 --no-pager >&2 || true
-    die "Сервис telemt остановился при запуске."
+cleanup() {
+  if [[ -n "$UPSTREAM_INSTALLER" && -f "$UPSTREAM_INSTALLER" ]]; then
+    rm -f "$UPSTREAM_INSTALLER"
   fi
-  if ss -H -ltn | awk -v suffix=":${SERVER_PORT}" '$4 ~ (suffix "$" ) { found=1 } END { exit !found }'; then
-    LINK="$(curl -fsS --max-time 2 http://127.0.0.1:9091/v1/users 2>/dev/null \
-      | jq -r '.data[]? | select(.username == "default") | .links.tls[0] // empty' \
-      | head -n 1 || true)"
-    [[ -n "${LINK}" ]] && break
+  return 0
+}
+trap cleanup EXIT
+
+on_error() {
+  local exit_code=$?
+  warn "Установка прервана с ошибкой."
+  if [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]]; then
+    warn "Бэкап предыдущей установки сохранён: $BACKUP_DIR"
   fi
-  sleep 1
-done
+  exit "$exit_code"
+}
+trap on_error ERR
 
-if [[ -z "${LINK}" ]]; then
-  journalctl -u "${SERVICE_NAME}" -n 80 --no-pager >&2 || true
-  die "Telemt не выдал Fake TLS-ссылку за 90 секунд. Проверьте логи выше."
-fi
+require_root() {
+  [[ "${EUID}" -eq 0 ]] || die "Запустите скрипт через sudo: sudo ./teleproxy-faketls-vk-install.sh"
+}
 
-ok "Telemt ${TELEMT_VERSION} установлен и запущен."
-printf '\n============================================================\n'
-printf ' Telegram MTProto Proxy: Direct + Fake TLS\n'
-printf '============================================================\n'
-printf ' SNI:    %s\n' "${SNI_DOMAIN}"
-printf ' Host:   %s\n' "${PUBLIC_HOST}"
-printf ' Port:   %s\n\n' "${SERVER_PORT}"
-printf ' Ссылка для подключения:\n%s\n\n' "${LINK}"
-printf ' Проверка статуса:\n  systemctl status telemt --no-pager\n'
-printf ' Логи:\n  journalctl -u telemt -f\n'
-printf ' Конфиг:\n  %s\n' "${CONFIG_FILE}"
-printf '============================================================\n'
+parse_args() {
+  while (($#)); do
+    case "$1" in
+      --host)
+        [[ $# -ge 2 ]] || die "После --host требуется значение."
+        PUBLIC_HOST="$2"
+        shift 2
+        ;;
+      --port)
+        [[ $# -ge 2 ]] || die "После --port требуется значение."
+        PROXY_PORT="$2"
+        shift 2
+        ;;
+      --replace)
+        REPLACE_EXISTING=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Неизвестный параметр: $1"
+        ;;
+    esac
+  done
+}
+
+collect_input() {
+  if [[ -z "$PUBLIC_HOST" ]]; then
+    read -r -p "Публичный домен или IPv4 вашего VPS для ссылки Telegram: " PUBLIC_HOST
+  fi
+
+  if [[ "$PROXY_PORT" == "$DEFAULT_PORT" && -t 0 ]]; then
+    local entered_port=""
+    read -r -p "Порт MTProto Proxy [443]: " entered_port
+    PROXY_PORT="${entered_port:-$DEFAULT_PORT}"
+  fi
+}
+
+validate_input() {
+  [[ -n "$PUBLIC_HOST" ]] || die "Домен/IP не может быть пустым."
+  [[ "$PUBLIC_HOST" =~ ^[A-Za-z0-9.-]+$ ]] ||
+    die "Используйте домен или IPv4 без схемы и пути, например proxy.example.com или 203.0.113.10."
+  [[ "$PUBLIC_HOST" != *".."* && "$PUBLIC_HOST" != .* && "$PUBLIC_HOST" != *. ]] ||
+    die "Некорректный домен/IP: $PUBLIC_HOST"
+
+  [[ "$PROXY_PORT" =~ ^[0-9]+$ ]] || die "Порт должен быть числом."
+  (( PROXY_PORT >= 1 && PROXY_PORT <= 65535 )) || die "Порт должен быть в диапазоне 1..65535."
+  [[ "$PROXY_PORT" != "$STATS_PORT" ]] ||
+    die "Порт ${STATS_PORT} зарезервирован для локальной страницы статистики Teleproxy. Выберите другой порт."
+
+  if [[ -f "$CONFIG_FILE" && "$REPLACE_EXISTING" -ne 1 ]]; then
+    die "Уже найдена конфигурация $CONFIG_FILE. Чтобы сознательно создать новый secret и заменить её, повторите запуск с --replace."
+  fi
+}
+
+install_dependencies() {
+  command -v apt-get >/dev/null 2>&1 ||
+    die "Этот простой установщик рассчитан на Ubuntu/Debian с apt-get."
+
+  info "Устанавливаю системные зависимости..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq ca-certificates curl openssl ufw iproute2 openssh-client openssh-server >/dev/null
+  log "Зависимости установлены."
+}
+
+detect_ssh_port() {
+  local ssh_port=""
+
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    ssh_port="$(awk '{print $4}' <<<"$SSH_CONNECTION" 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$ssh_port" ]] && command -v sshd >/dev/null 2>&1; then
+    ssh_port="$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}' || true)"
+  fi
+
+  if [[ ! "$ssh_port" =~ ^[0-9]+$ ]] || (( ssh_port < 1 || ssh_port > 65535 )); then
+    ssh_port="22"
+    warn "Не удалось точно определить SSH-порт; сохраняю стандартный доступ TCP 22."
+  fi
+
+  printf '%s' "$ssh_port"
+}
+
+configure_firewall() {
+  local ssh_port
+  ssh_port="$(detect_ssh_port)"
+
+  info "Настраиваю UFW: SSH TCP ${ssh_port} и MTProto TCP ${PROXY_PORT}..."
+  ufw allow "${ssh_port}/tcp" comment "SSH access" >/dev/null
+  ufw allow "${PROXY_PORT}/tcp" comment "Teleproxy MTProto Fake TLS" >/dev/null
+
+  if ufw status | grep -q '^Status: active'; then
+    log "UFW уже активен; правило TCP ${PROXY_PORT} добавлено."
+  else
+    ufw --force enable >/dev/null
+    log "UFW активирован; SSH TCP ${ssh_port} и proxy TCP ${PROXY_PORT} разрешены."
+  fi
+
+  ufw status numbered | grep -Fq "${PROXY_PORT}/tcp" ||
+    die "UFW не подтвердил правило для TCP ${PROXY_PORT}."
+}
+
+check_port_available() {
+  local checked_port
+  for checked_port in "$PROXY_PORT" "$STATS_PORT"; do
+    if ss -ltnH 2>/dev/null | awk -v port=":${checked_port}" '$4 ~ port "$" {found=1} END {exit !found}'; then
+      if systemctl is-active --quiet teleproxy 2>/dev/null; then
+        info "Порт ${checked_port} занят текущим teleproxy; служба будет заменена."
+      else
+        ss -ltnp 2>/dev/null | grep -E "[:.]${checked_port}[[:space:]]" || true
+        die "TCP-порт ${checked_port} уже занят другим процессом. Teleproxy использует ${PROXY_PORT} для proxy и ${STATS_PORT} для статистики."
+      fi
+    fi
+  done
+}
+
+check_fake_tls_backend() {
+  info "Проверяю доступность TLS 1.3 backend для SNI ${SNI_DOMAIN}..."
+  if timeout 15 openssl s_client       -connect "${SNI_DOMAIN}:443"       -servername "$SNI_DOMAIN"       -tls1_3 </dev/null 2>/dev/null |
+      grep -q "TLSv1.3"; then
+    log "${SNI_DOMAIN} доступен с TLS 1.3; Fake-TLS backend пригоден."
+  else
+    die "С VPS не удалось установить TLS 1.3-соединение с ${SNI_DOMAIN}:443. Fake TLS с этим SNI не сможет работать; проверьте DNS/исходящий доступ VPS."
+  fi
+}
+
+backup_existing() {
+  if [[ -e /etc/teleproxy || -e /usr/local/bin/teleproxy || -e /etc/systemd/system/teleproxy.service ]]; then
+    BACKUP_DIR="${BACKUP_ROOT}/$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$BACKUP_DIR"
+
+    systemctl is-active --quiet teleproxy 2>/dev/null && WAS_ACTIVE=1 || true
+    [[ -e /etc/teleproxy ]] && cp -a /etc/teleproxy "$BACKUP_DIR/"
+    [[ -e /usr/local/bin/teleproxy ]] && cp -a /usr/local/bin/teleproxy "$BACKUP_DIR/"
+    [[ -e /etc/systemd/system/teleproxy.service ]] && cp -a /etc/systemd/system/teleproxy.service "$BACKUP_DIR/"
+
+    log "Предыдущие файлы Teleproxy сохранены: $BACKUP_DIR"
+  fi
+}
+
+install_teleproxy() {
+  UPSTREAM_INSTALLER="$(mktemp)"
+  info "Загружаю официальный установщик Teleproxy v${TELEPROXY_VERSION}..."
+  curl -fsSL "$UPSTREAM_INSTALLER_URL" -o "$UPSTREAM_INSTALLER"
+
+  grep -q 'EE_DOMAIN' "$UPSTREAM_INSTALLER" &&
+    grep -q 'TELEPROXY_VERSION' "$UPSTREAM_INSTALLER" &&
+    grep -q 'direct = true' "$UPSTREAM_INSTALLER" ||
+    die "Формат официального установщика неожиданно изменился; установка остановлена безопасно."
+
+  # Upstream keeps an old config during upgrades. For --replace we need a
+  # newly generated secret plus guaranteed vk.com/port/direct settings.
+  if [[ "$REPLACE_EXISTING" -eq 1 && -f "$CONFIG_FILE" ]]; then
+    systemctl stop teleproxy 2>/dev/null || true
+    rm -f "$CONFIG_FILE"
+    warn "Существующая конфигурация заменяется; старые proxy-ссылки перестанут работать."
+  fi
+
+  info "Устанавливаю Teleproxy в Direct + Fake-TLS режиме (SNI ${SNI_DOMAIN})..."
+  PORT="$PROXY_PORT" \
+  STATS_PORT="$STATS_PORT" \
+  WORKERS="1" \
+  SECRET_COUNT="1" \
+  EE_DOMAIN="$SNI_DOMAIN" \
+  TELEPROXY_VERSION="$TELEPROXY_VERSION" \
+    sh "$UPSTREAM_INSTALLER"
+
+  log "Teleproxy установлен."
+}
+
+verify_installation() {
+  info "Проверяю службу и listener TCP ${PROXY_PORT}..."
+  local attempt
+  for attempt in {1..30}; do
+    if systemctl is-active --quiet teleproxy &&
+       ss -ltnH 2>/dev/null | awk -v port=":${PROXY_PORT}" '$4 ~ port "$" {found=1} END {exit !found}'; then
+      log "teleproxy.service активен и слушает TCP ${PROXY_PORT}."
+      return 0
+    fi
+    sleep 1
+  done
+
+  systemctl status teleproxy --no-pager || true
+  journalctl -u teleproxy -n 80 --no-pager || true
+  die "Teleproxy не открыл TCP ${PROXY_PORT}. Выше показаны диагностические логи."
+}
+
+print_connection_link() {
+  local raw_secret domain_hex client_secret tg_link https_link
+  raw_secret="$(awk -F'"' '/^[[:space:]]*key[[:space:]]*=[[:space:]]*"/ {print $2; exit}' "$CONFIG_FILE")"
+  [[ "$raw_secret" =~ ^[0-9a-fA-F]{32}$ ]] || die "Не удалось извлечь базовый secret из $CONFIG_FILE."
+
+  domain_hex="$(printf '%s' "$SNI_DOMAIN" | od -An -tx1 | tr -d ' \n')"
+  client_secret="ee${raw_secret}${domain_hex}"
+  tg_link="tg://proxy?server=${PUBLIC_HOST}&port=${PROXY_PORT}&secret=${client_secret}"
+  https_link="https://t.me/proxy?server=${PUBLIC_HOST}&port=${PROXY_PORT}&secret=${client_secret}"
+
+  cat <<EOF
+
+============================================================
+ Teleproxy MTProto Proxy готов
+============================================================
+ Версия:     v${TELEPROXY_VERSION}
+ Режим:      Direct-to-DC + Fake-TLS (EE)
+ SNI:        ${SNI_DOMAIN}
+ Сервер:     ${PUBLIC_HOST}
+ Порт:       ${PROXY_PORT}/tcp
+
+ Ссылка для Telegram:
+ ${tg_link}
+
+ Альтернативная ссылка:
+ ${https_link}
+
+ Проверка:
+   systemctl status teleproxy --no-pager
+   journalctl -u teleproxy -f
+   ufw status verbose
+
+ Конфигурация:
+   ${CONFIG_FILE}
+============================================================
+
+EOF
+
+  warn "Если у VPS есть внешний Cloud Firewall / Security Group, в панели хостинга также разрешите входящий TCP ${PROXY_PORT}."
+  warn "Порт статистики ${STATS_PORT} намеренно не открывается в UFW для публичного доступа."
+}
+
+main() {
+  parse_args "$@"
+  require_root
+  collect_input
+  validate_input
+  install_dependencies
+  check_port_available
+  check_fake_tls_backend
+  backup_existing
+  configure_firewall
+  install_teleproxy
+  verify_installation
+  print_connection_link
+}
+
+main "$@"
