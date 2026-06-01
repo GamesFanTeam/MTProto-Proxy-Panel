@@ -1,80 +1,83 @@
 #!/usr/bin/env bash
-# MTProto Proxy one-click installer based on seriyps/mtproto_proxy
-# Upstream: https://github.com/seriyps/mtproto_proxy
-# Installer version: 1.1
+# One-click MTProto Proxy installer: Telemt Direct + Fake TLS (SNI vk.com)
+# Version: 1.0
 #
-# Default deployment:
+# Why Telemt Direct:
+#   seriyps/mtproto_proxy requires https://core.telegram.org/getProxySecret
+#   and getProxyConfig at startup. On VPS networks where that bootstrap URL
+#   is blocked, it cannot start. Telemt with use_middle_proxy=false routes
+#   directly to Telegram DCs and does not require the Middle Proxy bootstrap.
+#
+# Defaults:
 #   - Ubuntu/Debian VPS
+#   - TCP port: 443
 #   - Fake TLS only
 #   - SNI: vk.com
-#   - TCP port: 443
-#   - public IPv4 of the server is detected automatically
-#   - Docker container built from pinned upstream release 0.8.4
-#   - patches upstream 3-second Telegram bootstrap timeout to 60 seconds
+#   - public IPv4 detected automatically
+#   - Telemt pinned to 3.4.13
 #
-# Optional non-interactive overrides:
-#   PORT=8443 SERVER_IP=203.0.113.10 sudo -E bash ./mtproto-seriyps-faketls-v1.1.sh
-#   ROTATE_SECRET=1 sudo -E bash ./mtproto-seriyps-faketls-v1.1.sh
+# Optional overrides:
+#   PORT=8443 SERVER_IP=203.0.113.10 sudo -E bash ./mtproto-telemt-direct-faketls-v1.0.sh
+#   ROTATE_SECRET=1 sudo -E bash ./mtproto-telemt-direct-faketls-v1.0.sh
 
 set -Eeuo pipefail
 umask 077
 
-readonly INSTALLER_VERSION="1.1"
-readonly UPSTREAM_VERSION="0.8.4"
-readonly UPSTREAM_REPOSITORY="https://github.com/seriyps/mtproto_proxy"
-readonly CORE_SECRET_URL="https://core.telegram.org/getProxySecret"
-readonly CORE_CONFIG_URL="https://core.telegram.org/getProxyConfig"
-readonly CORE_HTTP_TIMEOUT_MS="60000"
+readonly INSTALLER_VERSION="1.0"
+readonly TELEMT_VERSION="3.4.13"
 readonly SNI="vk.com"
-readonly EMPTY_AD_TAG="8b081275ec12abd306faeb2f13efbdcb"
-readonly CONTAINER_NAME="mtproto-proxy-seriyps"
-readonly IMAGE_REPOSITORY="local/mtproto-proxy-seriyps"
-readonly INSTALL_DIR="/opt/mtproto-proxy-seriyps"
-readonly STATE_FILE="/etc/mtproto-proxy-seriyps.conf"
-readonly LOG_FILE="/var/log/mtproto-proxy-seriyps-install.log"
+readonly USERNAME="main"
+readonly FAILED_SERIYPS_CONTAINER="mtproto-proxy-seriyps"
+readonly SERVICE_NAME="telemt"
+readonly CONFIG_DIR="/etc/telemt"
+readonly CONFIG_FILE="/etc/telemt/telemt.toml"
+readonly STATE_FILE="/etc/telemt/direct-faketls.state"
+readonly DATA_DIR="/var/lib/telemt"
+readonly WORK_DIR="/opt/telemt"
+readonly BINARY_PATH="/usr/local/bin/telemt"
+readonly SERVICE_FILE="/etc/systemd/system/telemt.service"
 readonly LINK_FILE="/root/mtproto-proxy-link.txt"
+readonly LOG_FILE="/var/log/telemt-direct-faketls-install.log"
+readonly BACKUP_ROOT="/var/backups/telemt-direct-faketls"
 
 PORT="${PORT:-443}"
 SERVER_IP="${SERVER_IP:-}"
 ROTATE_SECRET="${ROTATE_SECRET:-0}"
+SECRET=""
 
-mkdir -p /var/log
+mkdir -p "$(dirname "$LOG_FILE")"
 touch "$LOG_FILE"
 chmod 600 "$LOG_FILE"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 info()    { printf '\033[1;32m[INFO]\033[0m %s\n' "$*"; }
+ok()      { printf '\033[1;32m[ OK ]\033[0m %s\n' "$*"; }
 warn()    { printf '\033[1;33m[WARN]\033[0m %s\n' "$*"; }
-success() { printf '\033[1;32m[ OK ]\033[0m %s\n' "$*"; }
-die()     { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
+fail()    { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 
 on_error() {
   local line="$1"
-  local command="$2"
-  printf '\033[1;31m[FAIL]\033[0m Ошибка на строке %s при выполнении: %s\n' "$line" "$command" >&2
-  printf 'Полный журнал: %s\n' "$LOG_FILE" >&2
+  local cmd="$2"
+  printf '\033[1;31m[FAIL]\033[0m Ошибка на строке %s: %s\n' "$line" "$cmd" >&2
+  printf 'Журнал установки: %s\n' "$LOG_FILE" >&2
 }
 trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
 
 require_root() {
-  [[ "${EUID}" -eq 0 ]] || die "Запустите скрипт от root: sudo bash $0"
+  [[ "$EUID" -eq 0 ]] || fail "Запустите от root: sudo bash $0"
 }
 
 validate_port() {
-  [[ "$PORT" =~ ^[0-9]+$ ]] || die "PORT должен быть числом: получено '$PORT'."
-  (( PORT >= 1 && PORT <= 65535 )) || die "PORT должен быть в диапазоне 1..65535."
+  [[ "$PORT" =~ ^[0-9]+$ ]] || fail "PORT должен быть числом."
+  (( PORT >= 1 && PORT <= 65535 )) || fail "PORT должен быть в диапазоне 1..65535."
 }
 
 is_ipv4() {
   local ip="$1"
   awk -F. '
     NF != 4 { exit 1 }
-    {
-      for (i = 1; i <= 4; i++) {
-        if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) exit 1
-      }
-    }
-  ' <<< "$ip"
+    { for (i=1; i<=4; i++) if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) exit 1 }
+  ' <<<"$ip"
 }
 
 is_private_ipv4() {
@@ -90,390 +93,331 @@ is_private_ipv4() {
 detect_public_ipv4() {
   local ip=""
   local url=""
-  local -a services=(
-    "https://api.ipify.org"
-    "https://ipv4.icanhazip.com"
-    "http://ipv4.seriyps.com/"
-  )
-
   if [[ -n "$SERVER_IP" ]]; then
-    is_ipv4 "$SERVER_IP" || die "SERVER_IP не является корректным IPv4-адресом: '$SERVER_IP'."
+    is_ipv4 "$SERVER_IP" || fail "SERVER_IP некорректен: $SERVER_IP"
     printf '%s' "$SERVER_IP"
-    return 0
+    return
   fi
 
-  for url in "${services[@]}"; do
-    ip="$(curl -4fsS --max-time 8 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+  for url in "https://api.ipify.org" "https://ipv4.icanhazip.com"; do
+    ip="$(curl -4fsS --connect-timeout 5 --max-time 10 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
     if [[ -n "$ip" ]] && is_ipv4 "$ip" && ! is_private_ipv4 "$ip"; then
       printf '%s' "$ip"
-      return 0
+      return
     fi
   done
 
-  ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}' || true)"
-  if [[ -n "$ip" ]] && is_ipv4 "$ip" && ! is_private_ipv4 "$ip"; then
-    printf '%s' "$ip"
-    return 0
-  fi
-
-  die "Не удалось определить публичный IPv4 VPS. Запустите повторно так: SERVER_IP=ВАШ_IP sudo -E bash $0"
-}
-
-check_telegram_bootstrap_access() {
-  local tmp_dir secret_file config_file secret_size
-  tmp_dir="$(mktemp -d)"
-  secret_file="$tmp_dir/proxy-secret"
-  config_file="$tmp_dir/proxy-multi.conf"
-
-  info "Проверка доступа VPS к Telegram bootstrap API (до 60 секунд на запрос)..."
-  if ! curl -4fsSL --retry 2 --retry-all-errors --retry-delay 2 \
-       --connect-timeout 15 --max-time 60 -o "$secret_file" "$CORE_SECRET_URL"; then
-    rm -rf "$tmp_dir"
-    die "VPS не может загрузить getProxySecret с core.telegram.org. Этот upstream не запустится без доступа к Telegram bootstrap API."
-  fi
-  if ! curl -4fsSL --retry 2 --retry-all-errors --retry-delay 2 \
-       --connect-timeout 15 --max-time 60 -o "$config_file" "$CORE_CONFIG_URL"; then
-    rm -rf "$tmp_dir"
-    die "VPS не может загрузить getProxyConfig с core.telegram.org. Этот upstream не запустится без списка Telegram middle-proxy."
-  fi
-
-  secret_size="$(wc -c < "$secret_file" | tr -d ' ')"
-  [[ "$secret_size" =~ ^[0-9]+$ ]] && (( secret_size >= 32 )) || {
-    rm -rf "$tmp_dir"
-    die "Ответ getProxySecret получен, но выглядит некорректно (размер: ${secret_size:-unknown} байт)."
-  }
-  grep -q '^proxy_for ' "$config_file" || {
-    rm -rf "$tmp_dir"
-    die "Ответ getProxyConfig получен, но в нём нет записей proxy_for."
-  }
-
-  rm -rf "$tmp_dir"
-  success "Telegram bootstrap API доступен с VPS."
+  fail "Не удалось определить публичный IPv4. Запустите: SERVER_IP=ВАШ_IP sudo -E bash $0"
 }
 
 install_dependencies() {
-  if [[ ! -r /etc/os-release ]]; then
-    die "Не удалось определить ОС. Поддерживаются Debian и Ubuntu."
-  fi
-
+  [[ -r /etc/os-release ]] || fail "Поддерживаются Debian/Ubuntu."
   # shellcheck source=/dev/null
   source /etc/os-release
   case "${ID:-}" in
     debian|ubuntu) ;;
-    *) die "Поддерживаются Debian/Ubuntu. Обнаружено: ${PRETTY_NAME:-unknown}." ;;
+    *) fail "Поддерживаются Debian/Ubuntu. Найдено: ${PRETTY_NAME:-unknown}." ;;
   esac
 
-  info "Установка зависимостей и Docker на ${PRETTY_NAME:-$ID}..."
+  info "Установка зависимостей на ${PRETTY_NAME:-$ID}..."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y --no-install-recommends ca-certificates curl openssl tar docker.io iproute2
-
-  systemctl enable --now docker >/dev/null
-  docker info >/dev/null 2>&1 || die "Docker установлен, но daemon недоступен."
-  success "Docker готов."
+  apt-get install -y --no-install-recommends ca-certificates curl openssl tar iproute2 jq
+  ok "Зависимости готовы."
 }
 
-load_or_create_secrets() {
-  BASE_SECRET=""
-  SNI_SALT=""
-  ERLANG_COOKIE=""
+backup_existing_installation() {
+  local stamp backup_dir
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  backup_dir="$BACKUP_ROOT/$stamp"
+  mkdir -p "$backup_dir"
+
+  [[ -d "$CONFIG_DIR" ]] && cp -a "$CONFIG_DIR" "$backup_dir/" || true
+  [[ -f "$SERVICE_FILE" ]] && cp -a "$SERVICE_FILE" "$backup_dir/" || true
+  [[ -f "$BINARY_PATH" ]] && cp -a "$BINARY_PATH" "$backup_dir/" || true
+
+  ok "Резервная копия предыдущих файлов: $backup_dir"
+}
+
+stop_failed_previous_attempt() {
+  if command -v docker >/dev/null 2>&1 && docker container inspect "$FAILED_SERIYPS_CONTAINER" >/dev/null 2>&1; then
+    info "Удаляю аварийный контейнер прежней попытки: $FAILED_SERIYPS_CONTAINER"
+    docker rm -f "$FAILED_SERIYPS_CONTAINER" >/dev/null 2>&1 || true
+  fi
+
+  if systemctl list-unit-files "${SERVICE_NAME}.service" --no-legend 2>/dev/null | grep -q "^${SERVICE_NAME}.service"; then
+    systemctl stop "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
+  fi
+}
+
+ensure_port_free() {
+  local in_use=""
+  in_use="$(ss -H -ltnp 2>/dev/null | awk -v p=":${PORT}" '$4 ~ (p "$") {print; exit}' || true)"
+  [[ -z "$in_use" ]] || fail "TCP-порт ${PORT} уже занят: ${in_use}. Освободите порт или используйте PORT=8443."
+}
+
+load_or_create_secret() {
+  mkdir -p "$CONFIG_DIR"
+  SECRET=""
 
   if [[ -f "$STATE_FILE" && "$ROTATE_SECRET" != "1" ]]; then
-    # This file is created root-only by this installer.
     # shellcheck source=/dev/null
     source "$STATE_FILE"
-    info "Найдена прежняя установка: сохраняю существующую ссылку/секрет."
+    if [[ "${SECRET:-}" =~ ^[0-9a-f]{32}$ ]]; then
+      info "Сохраняю ранее созданный клиентский секрет и ссылку."
+      return
+    fi
   fi
 
-  if [[ ! "${BASE_SECRET:-}" =~ ^[0-9a-f]{32}$ ]]; then
-    BASE_SECRET="$(openssl rand -hex 16)"
-  fi
-  if [[ ! "${SNI_SALT:-}" =~ ^[0-9a-f]{64}$ ]]; then
-    SNI_SALT="$(openssl rand -hex 32)"
-  fi
-  if [[ ! "${ERLANG_COOKIE:-}" =~ ^[A-Za-z0-9_]{8,80}$ ]]; then
-    ERLANG_COOKIE="mtp_$(openssl rand -hex 20)"
-  fi
-
-  if [[ "$ROTATE_SECRET" == "1" ]]; then
-    BASE_SECRET="$(openssl rand -hex 16)"
-    SNI_SALT="$(openssl rand -hex 32)"
-    ERLANG_COOKIE="mtp_$(openssl rand -hex 20)"
-    warn "Секрет обновлён: прежняя Telegram-ссылка перестанет подключаться."
-  fi
+  SECRET="$(openssl rand -hex 16)"
+  [[ "$ROTATE_SECRET" == "1" ]] && warn "Создан новый secret: старая ссылка перестанет подключаться."
 }
 
-build_client_link() {
-  SNI_HEX="$(printf '%s' "$SNI" | od -An -tx1 | tr -d ' \n')"
-  DERIVED_SECRET="$(printf '%s%s%s' "$SNI_SALT" "$BASE_SECRET" "$SNI" | sha256sum | cut -c1-32)"
-  CLIENT_SECRET="ee${DERIVED_SECRET}${SNI_HEX}"
-  TG_LINK="https://t.me/proxy?server=${SERVER_IP}&port=${PORT}&secret=${CLIENT_SECRET}"
+download_telemt() {
+  local arch libc asset tmpdir archive pinned_url latest_url
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|aarch64) ;;
+    *) fail "Архитектура $arch не поддержана этим установщиком." ;;
+  esac
+
+  libc="gnu"
+  if ldd --version 2>&1 | grep -qi musl; then
+    libc="musl"
+  fi
+
+  asset="telemt-${arch}-linux-${libc}.tar.gz"
+  pinned_url="https://github.com/telemt/telemt/releases/download/${TELEMT_VERSION}/${asset}"
+  latest_url="https://github.com/telemt/telemt/releases/latest/download/${asset}"
+  tmpdir="$(mktemp -d)"
+  archive="$tmpdir/$asset"
+
+  info "Загрузка Telemt ${TELEMT_VERSION} (${asset})..."
+  if ! curl -fL --retry 3 --connect-timeout 15 --max-time 180 -o "$archive" "$pinned_url"; then
+    warn "Pinned asset ${TELEMT_VERSION} недоступен; пробую latest asset из официального репозитория."
+    curl -fL --retry 3 --connect-timeout 15 --max-time 180 -o "$archive" "$latest_url" ||
+      fail "Не удалось скачать бинарник Telemt с GitHub."
+  fi
+
+  tar -xzf "$archive" -C "$tmpdir"
+  [[ -x "$tmpdir/telemt" ]] || chmod +x "$tmpdir/telemt" 2>/dev/null || true
+  [[ -f "$tmpdir/telemt" ]] || fail "В архиве Telemt не найден бинарник telemt."
+
+  install -m 0755 "$tmpdir/telemt" "$BINARY_PATH"
+  rm -rf "$tmpdir"
+  ok "Telemt установлен: $BINARY_PATH"
 }
 
-prepare_source_and_config() {
-  local archive="$INSTALL_DIR/mtproto_proxy-${UPSTREAM_VERSION}.tar.gz"
-  local unpack_dir="$INSTALL_DIR/source.new"
-  local extracted_dir="$INSTALL_DIR/mtproto_proxy-${UPSTREAM_VERSION}"
-
-  mkdir -p "$INSTALL_DIR"
-  rm -rf "$unpack_dir" "$extracted_dir"
-
-  info "Загрузка исходников ${UPSTREAM_REPOSITORY}, release ${UPSTREAM_VERSION}..."
-  curl -fL --retry 3 --connect-timeout 15 \
-    -o "$archive" \
-    "https://github.com/seriyps/mtproto_proxy/archive/refs/tags/${UPSTREAM_VERSION}.tar.gz"
-
-  tar -xzf "$archive" -C "$INSTALL_DIR"
-  [[ -d "$extracted_dir" ]] || die "Архив upstream распакован в неожиданную директорию."
-  mv "$extracted_dir" "$unpack_dir"
-
-  # Upstream 0.8.4 aborts startup if Telegram bootstrap does not answer in 3000 ms.
-  # Keep the release pinned, applying one auditable compatibility patch only.
-  if ! grep -q '{timeout, 3000}' "$unpack_dir/src/mtp_config.erl"; then
-    die "Не найден ожидаемый upstream timeout-паттерн; сборка остановлена, чтобы не применять небезопасную правку."
+create_user_and_direct_config() {
+  if ! id -u telemt >/dev/null 2>&1; then
+    useradd --system --home-dir "$WORK_DIR" --create-home --shell /usr/sbin/nologin telemt
   fi
-  sed -i "s/{timeout, 3000}/{timeout, ${CORE_HTTP_TIMEOUT_MS}}/" "$unpack_dir/src/mtp_config.erl"
-  grep -q "{timeout, ${CORE_HTTP_TIMEOUT_MS}}" "$unpack_dir/src/mtp_config.erl" || \
-    die "Не удалось применить патч Telegram bootstrap timeout."
-  success "Применён совместимый патч upstream: Telegram bootstrap timeout ${CORE_HTTP_TIMEOUT_MS} ms."
 
-  cat > "$unpack_dir/config/prod-sys.config" <<EOF
-%% Generated by mtproto-seriyps-faketls-v${INSTALLER_VERSION}.sh
-[
- {mtproto_proxy,
-  [
-   {allowed_protocols, [mtp_fake_tls]},
-   {per_sni_secrets, on},
-   {per_sni_secret_salt, <<"${SNI_SALT}">>},
-   {domain_fronting, "${SNI}:443"},
-   {domain_fronting_timeout_sec, 10},
-   {proxy_secret_url, "${CORE_SECRET_URL}"},
-   {proxy_config_url, "${CORE_CONFIG_URL}"},
-   {external_ip, "${SERVER_IP}"},
-   {reset_close_socket, handshake_error},
-   {replay_check_server_error_filter, first},
-   {replay_check_session_storage, on},
-   {ports,
-    [#{name => mtp_fake_tls_vk,
-       listen_ip => "0.0.0.0",
-       port => ${PORT},
-       secret => <<"${BASE_SECRET}">>,
-       tag => <<"${EMPTY_AD_TAG}">>}
-    ]}
-  ]},
- {kernel,
-  [{logger_level, info},
-   {logger,
-    [{handler, default, logger_std_h,
-      #{level => info,
-        config => #{type => file,
-                    file => "/var/log/mtproto-proxy/application.log",
-                    max_no_bytes => 104857600,
-                    max_no_files => 10,
-                    filesync_repeat_interval => no_repeat}}},
-     {handler, console, logger_std_h,
-      #{level => critical,
-        config => #{type => standard_io}}}
-    ]}]},
- {sasl, [{errlog_type, error}]}
-].
+  mkdir -p "$CONFIG_DIR" "$DATA_DIR/tlsfront" "$WORK_DIR"
+  chown -R telemt:telemt "$DATA_DIR" "$WORK_DIR"
+
+  cat > "$CONFIG_FILE" <<EOF
+# Generated by mtproto-telemt-direct-faketls-v${INSTALLER_VERSION}.sh
+# Transport: Telegram client -> this VPS -> Telegram DC directly
+# No Middle Proxy and no getProxySecret/getProxyConfig bootstrap are used.
+
+[general]
+config_strict = true
+use_middle_proxy = false
+fast_mode = true
+log_level = "normal"
+
+[general.modes]
+classic = false
+secure = false
+tls = true
+
+[general.links]
+show = "*"
+public_host = "${SERVER_IP}"
+public_port = ${PORT}
+
+[server]
+port = ${PORT}
+
+[server.api]
+enabled = true
+listen = "127.0.0.1:9091"
+whitelist = ["127.0.0.1/32", "::1/128"]
+minimal_runtime_enabled = false
+minimal_runtime_cache_ttl_ms = 1000
+
+[[server.listeners]]
+ip = "0.0.0.0"
+
+[censorship]
+tls_domain = "${SNI}"
+mask = true
+tls_emulation = true
+tls_front_dir = "${DATA_DIR}/tlsfront"
+
+[access.users]
+${USERNAME} = "${SECRET}"
 EOF
 
-  cat > "$unpack_dir/config/prod-vm.args" <<EOF
--name mtproto_proxy@127.0.0.1
--setcookie ${ERLANG_COOKIE}
-+K true
-+A 2
-+SDio 2
-EOF
+  chmod 600 "$CONFIG_FILE"
+  chown root:telemt "$CONFIG_FILE"
 
-  SOURCE_DIR="$unpack_dir"
-  success "Конфигурация создана: Fake TLS only, SNI=${SNI}, port=${PORT}."
-}
-
-build_image() {
-  local fingerprint
-  fingerprint="$(printf '%s|%s|%s|%s|%s' "$UPSTREAM_VERSION" "$PORT" "$SERVER_IP" "$BASE_SECRET" "$SNI_SALT" | sha256sum | cut -c1-12)"
-  IMAGE="${IMAGE_REPOSITORY}:${UPSTREAM_VERSION}-${fingerprint}"
-
-  info "Сборка Docker-образа из официальных исходников ${UPSTREAM_VERSION}..."
-  docker build --pull --tag "$IMAGE" "$SOURCE_DIR"
-
-  rm -rf "$INSTALL_DIR/source"
-  mv "$SOURCE_DIR" "$INSTALL_DIR/source"
-  success "Образ собран: ${IMAGE}."
-}
-
-port_is_listening() {
-  ss -H -ltn 2>/dev/null | awk -v p=":${PORT}" '$4 ~ (p "$") {found=1} END {exit !found}'
-}
-
-running_our_container() {
-  docker ps --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"
-}
-
-restore_previous_container() {
-  local backup_name="$1"
-  if docker container inspect "$backup_name" >/dev/null 2>&1; then
-    warn "Возвращаю предыдущий рабочий контейнер."
-    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-    docker rename "$backup_name" "$CONTAINER_NAME" >/dev/null
-    docker start "$CONTAINER_NAME" >/dev/null
-  fi
-}
-
-deploy_container() {
-  local backup_name="${CONTAINER_NAME}-rollback"
-
-  if port_is_listening && ! running_our_container; then
-    die "TCP-порт ${PORT} уже занят сторонним процессом. Освободите порт или запустите с PORT=другой_порт."
-  fi
-
-  docker rm -f "$backup_name" >/dev/null 2>&1 || true
-  if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
-    info "Останавливаю прежний контейнер с возможностью автоматического отката."
-    docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
-    docker rename "$CONTAINER_NAME" "$backup_name" >/dev/null
-  fi
-
-  info "Запуск контейнера ${CONTAINER_NAME}..."
-  if ! docker run -d \
-      --name "$CONTAINER_NAME" \
-      --network host \
-      --restart unless-stopped \
-      --log-opt max-size=20m \
-      --log-opt max-file=3 \
-      "$IMAGE" >/dev/null; then
-    restore_previous_container "$backup_name"
-    die "Не удалось запустить новый контейнер."
-  fi
-
-  local attempt
-  for attempt in {1..90}; do
-    if running_our_container && port_is_listening; then
-      docker rm -f "$backup_name" >/dev/null 2>&1 || true
-      success "Прокси слушает TCP-порт ${PORT}."
-      return 0
-    fi
-    sleep 1
-  done
-
-  docker logs --tail 80 "$CONTAINER_NAME" || true
-  restore_previous_container "$backup_name"
-  die "Контейнер не открыл порт ${PORT}; предыдущая установка восстановлена при её наличии."
-}
-
-configure_ufw_if_active() {
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-    info "UFW активен: открываю TCP-порт ${PORT}."
-    ufw allow "${PORT}/tcp" >/dev/null
-    success "Правило UFW добавлено."
-  fi
-}
-
-check_middle_proxy_readiness() {
-  local attempt logs
-  info "Проверка исходящего соединения к Telegram middle-proxy..."
-  for attempt in {1..30}; do
-    logs="$(docker logs "$CONTAINER_NAME" 2>&1 || true)"
-    if grep -q 'handshake complete' <<< "$logs"; then
-      success "Соединение с Telegram middle-proxy установлено."
-      return 0
-    fi
-    sleep 1
-  done
-  warn "Порт открыт, но в журнале пока нет подтверждения handshake с Telegram middle-proxy."
-  warn "Если ссылка не подключится в Telegram, проверьте исходящую доступность middle-proxy с этого VPS."
-}
-
-check_fake_tls_fronting() {
-  info "Проверка маскировки TLS через SNI ${SNI}..."
-  if timeout 15 openssl s_client \
-       -connect "127.0.0.1:${PORT}" \
-       -servername "$SNI" \
-       -brief </dev/null 2>&1 | grep -qi 'CONNECTION ESTABLISHED'; then
-    success "Fake TLS fronting отвечает как HTTPS ${SNI}."
-  else
-    warn "Контейнер запущен, но локально не удалось подтвердить fronting к ${SNI}:443."
-    warn "Это возможно при исходящей фильтрации HTTPS на VPS; проверьте подключение по ссылке в Telegram."
-  fi
-}
-
-persist_state_and_link() {
   cat > "$STATE_FILE" <<EOF
-# Root-only state generated by mtproto-seriyps-faketls-v${INSTALLER_VERSION}.sh
-BASE_SECRET='${BASE_SECRET}'
-SNI_SALT='${SNI_SALT}'
-ERLANG_COOKIE='${ERLANG_COOKIE}'
+SECRET='${SECRET}'
 EOF
   chmod 600 "$STATE_FILE"
+  ok "Создан Direct-конфиг: Fake TLS only, SNI=${SNI}, port=${PORT}."
+}
+
+create_systemd_service() {
+  cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Telemt MTProto Proxy Direct Fake TLS (${SNI})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=telemt
+Group=telemt
+WorkingDirectory=${DATA_DIR}
+ExecStart=${BINARY_PATH} ${CONFIG_FILE}
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=${DATA_DIR}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable "$SERVICE_NAME" >/dev/null
+}
+
+allow_ufw_if_active() {
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw allow "${PORT}/tcp" >/dev/null
+    ok "UFW: открыт TCP-порт ${PORT}."
+  fi
+}
+
+probe_known_telegram_dcs() {
+  local endpoint host port good=0
+  local -a endpoints=(
+    "149.154.175.50:443"
+    "149.154.167.51:443"
+    "149.154.175.100:443"
+    "149.154.167.91:443"
+    "149.154.171.5:443"
+    "91.105.192.100:443"
+  )
+
+  info "Проверка исходящего TCP-доступа к известным Telegram DC:443..."
+  for endpoint in "${endpoints[@]}"; do
+    host="${endpoint%:*}"
+    port="${endpoint##*:}"
+    if timeout 4 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null; then
+      printf '  [ OK ] %s доступен\n' "$endpoint"
+      good=$((good + 1))
+    else
+      printf '  [ -- ] %s недоступен за 4 с\n' "$endpoint"
+    fi
+  done
+
+  if (( good == 0 )); then
+    warn "Ни один проверенный Telegram DC не доступен. Сервис установится, но прокси, вероятнее всего, не соединится на этом VPS."
+  else
+    ok "Доступны Telegram DC: ${good} из ${#endpoints[@]}."
+  fi
+}
+
+start_and_wait() {
+  local attempt
+  info "Запуск Telemt Direct; инициализация DC может занять до 90 секунд..."
+  systemctl restart "$SERVICE_NAME"
+
+  for attempt in {1..90}; do
+    if ss -H -ltn 2>/dev/null | awk -v p=":${PORT}" '$4 ~ (p "$") {found=1} END {exit !found}'; then
+      ok "Telemt слушает TCP-порт ${PORT}."
+      return 0
+    fi
+    if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+      journalctl -u "$SERVICE_NAME" -n 100 --no-pager || true
+      fail "Telemt завершился при запуске."
+    fi
+    sleep 1
+  done
+
+  journalctl -u "$SERVICE_NAME" -n 120 --no-pager || true
+  fail "Telemt не открыл порт ${PORT} за 90 секунд."
+}
+
+get_and_save_link() {
+  local response tg_link=""
+  response="$(curl -fsS --retry 3 --retry-delay 1 http://127.0.0.1:9091/v1/users 2>/dev/null || true)"
+  if [[ -n "$response" ]]; then
+    tg_link="$(jq -r '.data[]? | .links.tls[]? // empty' <<<"$response" | head -n1 || true)"
+  fi
+
+  if [[ -z "$tg_link" ]]; then
+    tg_link="$(journalctl -u "$SERVICE_NAME" --no-pager -n 200 2>/dev/null | sed -n 's/.*EE-TLS:[[:space:]]*\(tg:\/\/proxy[^[:space:]]*\).*/\1/p' | tail -n1 || true)"
+  fi
+
+  [[ -n "$tg_link" ]] || fail "Сервис запущен, но не удалось получить Fake TLS ссылку из API Telemt. Проверьте: curl -s http://127.0.0.1:9091/v1/users | jq"
 
   cat > "$LINK_FILE" <<EOF
-MTProto Proxy / seriyps/mtproto_proxy ${UPSTREAM_VERSION}
+MTProto Proxy / Telemt ${TELEMT_VERSION}
+Mode: Direct DC (use_middle_proxy=false)
 Server: ${SERVER_IP}
 Port: ${PORT}
 Fake TLS SNI: ${SNI}
-Telegram link:
-${TG_LINK}
+
+${tg_link}
 EOF
   chmod 600 "$LINK_FILE"
-}
 
-print_result() {
-  cat <<EOF
-
-============================================================
-  MTProto Proxy установлен и запущен
-============================================================
-Проект:        seriyps/mtproto_proxy ${UPSTREAM_VERSION} + bootstrap-timeout patch
-IP сервера:    ${SERVER_IP}
-Порт:          ${PORT}/tcp
-Режим:         Fake TLS only
-SNI:           ${SNI}
-Автозапуск:    Docker --restart unless-stopped
-
-Ссылка для добавления прокси в Telegram:
-${TG_LINK}
-
-Ссылка также сохранена в: ${LINK_FILE}
-Журнал установки:          ${LOG_FILE}
-Bootstrap API:              core.telegram.org, timeout ${CORE_HTTP_TIMEOUT_MS} ms
-
-Проверить работу:
-  docker ps --filter name=${CONTAINER_NAME}
-  docker logs --tail 100 ${CONTAINER_NAME}
-
-Перезапустить:
-  docker restart ${CONTAINER_NAME}
-
-Важно: убедитесь, что входящий TCP-порт ${PORT} открыт
-в firewall/security group вашего VPS-провайдера.
-============================================================
-EOF
+  printf '\n============================================================\n'
+  printf ' MTProto Proxy установлен: Telemt Direct + Fake TLS\n'
+  printf '============================================================\n'
+  printf 'IP сервера: %s\n' "$SERVER_IP"
+  printf 'Порт:       %s/tcp\n' "$PORT"
+  printf 'SNI:        %s\n' "$SNI"
+  printf 'Маршрут:    Telegram client -> VPS -> Telegram DC (Direct)\n'
+  printf 'Middle:     отключён; core.telegram.org bootstrap не нужен\n\n'
+  printf 'Ссылка для Telegram:\n%s\n\n' "$tg_link"
+  printf 'Ссылка сохранена: %s\n' "$LINK_FILE"
+  printf 'Проверка логов:    journalctl -u telemt -n 100 --no-pager\n'
+  printf '============================================================\n'
 }
 
 main() {
   require_root
   validate_port
-
-  info "MTProto Proxy one-click installer v${INSTALLER_VERSION}"
-  info "Параметры по умолчанию: upstream=${UPSTREAM_VERSION}, SNI=${SNI}, port=${PORT}."
+  info "MTProto one-click installer v${INSTALLER_VERSION}: Telemt Direct + Fake TLS ${SNI}, port ${PORT}."
 
   install_dependencies
   SERVER_IP="$(detect_public_ipv4)"
-  success "Определён публичный IPv4 сервера: ${SERVER_IP}."
-  check_telegram_bootstrap_access
+  ok "Публичный IPv4 сервера: ${SERVER_IP}."
 
-  load_or_create_secrets
-  build_client_link
-  prepare_source_and_config
-  build_image
-  configure_ufw_if_active
-  deploy_container
-  check_middle_proxy_readiness
-  check_fake_tls_fronting
-  persist_state_and_link
-  print_result
+  backup_existing_installation
+  stop_failed_previous_attempt
+  ensure_port_free
+  load_or_create_secret
+  download_telemt
+  create_user_and_direct_config
+  create_systemd_service
+  allow_ufw_if_active
+  probe_known_telegram_dcs
+  start_and_wait
+  get_and_save_link
 }
 
 main "$@"
