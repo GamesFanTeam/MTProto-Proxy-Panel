@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Telemt Direct + Fake TLS one-click installer
-# Version: 1.1
+# Version: 1.2 — diagnostic compatibility profile based on a confirmed connecting EE-TLS link
 #
 # Baseline route:
 #   Telegram client -> VPS:443 -> Telemt -> Telegram DC (Direct)
@@ -9,20 +9,23 @@
 #   - Telemt is pinned to 3.4.13.
 #   - Middle Proxy / ad_tag / sponsor mode are not configured.
 #   - Cascade is not configured or activated by this standalone installer.
-#   - Fake TLS SNI defaults to vk.com and may be chosen only from the allow-list below.
+#   - Fake TLS SNI defaults to mts.ru for this diagnostic compatibility profile.
+#   - A fresh per-server secret is generated; the supplied working proxy's secret is never reused.
+#   - Output includes Base64URL EE-TLS link (same representation as the confirmed connecting sample)
+#     and an equivalent canonical hex EE-TLS link.
 #
 # Run:
 #   sudo bash ./mtproto-telemt-direct-faketls-v1.1.sh
 #
 # Optional:
-#   SNI=yandex.ru sudo -E bash ./mtproto-telemt-direct-faketls-v1.1.sh
-#   PORT=8443 SERVER_HOST=proxy.example.com sudo -E bash ./mtproto-telemt-direct-faketls-v1.1.sh
-#   ROTATE_SECRET=1 sudo -E bash ./mtproto-telemt-direct-faketls-v1.1.sh
+#   SNI=vk.com sudo -E bash ./mtproto-telemt-direct-faketls-mts-v1.2.sh
+#   PORT=8443 SERVER_HOST=proxy.example.com sudo -E bash ./mtproto-telemt-direct-faketls-mts-v1.2.sh
+#   ROTATE_SECRET=1 sudo -E bash ./mtproto-telemt-direct-faketls-mts-v1.2.sh
 
 set -Eeuo pipefail
 umask 077
 
-readonly INSTALLER_VERSION="1.1"
+readonly INSTALLER_VERSION="1.2"
 readonly TELEMT_VERSION="3.4.13"
 readonly SERVICE_NAME="telemt"
 readonly USERNAME="main"
@@ -38,10 +41,10 @@ readonly LINK_FILE="/root/mtproto-proxy-link.txt"
 readonly LOG_FILE="/var/log/telemt-direct-faketls-install.log"
 readonly BACKUP_ROOT="/var/backups/telemt-direct-faketls"
 readonly STARTUP_TIMEOUT_SECONDS=120
-readonly -a ALLOWED_SNI=("vk.com" "yandex.ru" "ozon.ru" "mail.ru" "max.ru" "sber.ru")
+readonly -a ALLOWED_SNI=("mts.ru" "vk.com" "yandex.ru" "ozon.ru" "mail.ru" "max.ru" "sber.ru")
 
 PORT="${PORT:-443}"
-SNI="${SNI:-vk.com}"
+SNI="${SNI:-mts.ru}"
 SERVER_HOST="${SERVER_HOST:-}"
 ROTATE_SECRET="${ROTATE_SECRET:-0}"
 
@@ -441,38 +444,57 @@ hex_encode() {
   printf '%s' "$1" | od -An -tx1 | tr -d ' \n'
 }
 
+base64url_from_hex() {
+  local hex="$1" escaped="" i
+  [[ "$hex" =~ ^([0-9a-fA-F]{2})+$ ]] || fail "Внутренняя ошибка: некорректный HEX для Base64URL-ссылки."
+  for ((i = 0; i < ${#hex}; i += 2)); do
+    escaped+="\\x${hex:i:2}"
+  done
+  printf '%b' "$escaped" | base64 -w 0 | tr '+/' '-_' | tr -d '='
+}
+
 save_connection_link() {
-  local tls_secret link
-  tls_secret="ee${SECRET}$(hex_encode "$SNI")"
-  link="tg://proxy?server=${SERVER_HOST}&port=${PORT}&secret=${tls_secret}"
+  local raw_tls_hex tls_secret_hex tls_secret_base64url link link_hex
+  raw_tls_hex="ee${SECRET}$(hex_encode "$SNI")"
+  tls_secret_hex="$raw_tls_hex"
+  tls_secret_base64url="$(base64url_from_hex "$raw_tls_hex")"
+
+  # Base64URL is selected as the primary user-facing form because it matches
+  # the representation of the confirmed connecting EE-TLS sample.
+  link="tg://proxy?server=${SERVER_HOST}&port=${PORT}&secret=${tls_secret_base64url}"
+  link_hex="tg://proxy?server=${SERVER_HOST}&port=${PORT}&secret=${tls_secret_hex}"
 
   cat > "$LINK_FILE" <<EOF
-Telemt ${TELEMT_VERSION} — Direct + Fake TLS
+Telemt ${TELEMT_VERSION} — Direct + Fake TLS / mts compatibility profile
 Server: ${SERVER_HOST}
 Port: ${PORT}
 SNI: ${SNI}
 Middle Proxy: disabled
 Cascade: not configured
-Link:
+Primary link (EE-TLS Base64URL representation):
 ${link}
+
+Equivalent canonical EE-TLS hex link:
+${link_hex}
 EOF
   chmod 0600 "$LINK_FILE"
 
   printf '\n====================================================================\n'
-  printf ' TELEMT DIRECT + FAKE TLS УСТАНОВЛЕН\n'
+  printf ' TELEMT DIRECT + FAKE TLS УСТАНОВЛЕН (MTS COMPATIBILITY PROFILE)\n'
   printf '====================================================================\n'
   printf 'Telemt:   %s (pinned)\n' "$TELEMT_VERSION"
   printf 'Маршрут:  Telegram client -> VPS -> Telegram DC (Direct)\n'
   printf 'SNI:      %s\n' "$SNI"
   printf 'Порт:     %s/tcp\n' "$PORT"
-  printf 'Ссылка:\n%s\n\n' "$link"
+  printf 'Основная ссылка (Base64URL, как в проверенном образце):\n%s\n\n' "$link"
+  printf 'Эквивалентная hex-ссылка Telemt:\n%s\n\n' "$link_hex"
   printf 'Сохранено: %s\n' "$LINK_FILE"
   printf 'Логи:     journalctl -u telemt -n 150 --no-pager\n'
   printf 'Конфиг:   %s\n' "$CONFIG_FILE"
   printf 'Backup:   %s\n' "$BACKUP_DIR"
-  printf '\nВАЖНО: официальный README Telemt сообщает о блокировке TLS ClientHello\n'
-  printf 'Telegram-клиентов по JA3. Поэтому корректный listener/Fake TLS не\n'
-  printf 'гарантирует подключение конкретного официального клиента.\n'
+  printf '\nВАЖНО: совпадение EE-TLS/SNI/формата ссылки проверяет клиентский профиль,\n'
+  printf 'но не копирует backend чужого proxy. Если Direct-upstream с VPS недоступен,\n'
+  printf 'ссылка не заработает даже при полном совпадении клиентского профиля.\n'
   printf '====================================================================\n'
 }
 
