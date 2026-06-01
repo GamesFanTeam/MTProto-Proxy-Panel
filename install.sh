@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Telemt Direct + Fake TLS one-click installer
-# Version: 1.2 — diagnostic compatibility profile based on a confirmed connecting EE-TLS link
+# Version: 1.3 — mts.ru compatibility profile + safe apt/dpkg lock handling
 #
 # Baseline route:
 #   Telegram client -> VPS:443 -> Telemt -> Telegram DC (Direct)
@@ -18,14 +18,14 @@
 #   sudo bash ./mtproto-telemt-direct-faketls-v1.1.sh
 #
 # Optional:
-#   SNI=vk.com sudo -E bash ./mtproto-telemt-direct-faketls-mts-v1.2.sh
-#   PORT=8443 SERVER_HOST=proxy.example.com sudo -E bash ./mtproto-telemt-direct-faketls-mts-v1.2.sh
-#   ROTATE_SECRET=1 sudo -E bash ./mtproto-telemt-direct-faketls-mts-v1.2.sh
+#   SNI=vk.com sudo -E bash ./mtproto-telemt-direct-faketls-mts-v1.3.sh
+#   PORT=8443 SERVER_HOST=proxy.example.com sudo -E bash ./mtproto-telemt-direct-faketls-mts-v1.3.sh
+#   ROTATE_SECRET=1 sudo -E bash ./mtproto-telemt-direct-faketls-mts-v1.3.sh
 
 set -Eeuo pipefail
 umask 077
 
-readonly INSTALLER_VERSION="1.2"
+readonly INSTALLER_VERSION="1.3"
 readonly TELEMT_VERSION="3.4.13"
 readonly SERVICE_NAME="telemt"
 readonly USERNAME="main"
@@ -41,6 +41,7 @@ readonly LINK_FILE="/root/mtproto-proxy-link.txt"
 readonly LOG_FILE="/var/log/telemt-direct-faketls-install.log"
 readonly BACKUP_ROOT="/var/backups/telemt-direct-faketls"
 readonly STARTUP_TIMEOUT_SECONDS=120
+readonly APT_LOCK_TIMEOUT_SECONDS=600
 readonly -a ALLOWED_SNI=("mts.ru" "vk.com" "yandex.ru" "ozon.ru" "mail.ru" "max.ru" "sber.ru")
 
 PORT="${PORT:-443}"
@@ -139,8 +140,12 @@ install_dependencies() {
 
   info "Устанавливаю зависимости на ${PRETTY_NAME:-$ID}."
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y --no-install-recommends \
+
+  # unattended-upgrades commonly owns dpkg locks immediately after a fresh VPS boot.
+  # Never remove lock files and never kill the updater: apt safely waits for it.
+  info "Ожидаю освобождения apt/dpkg lock до ${APT_LOCK_TIMEOUT_SECONDS} сек., если запущены фоновые обновления."
+  apt-get -o DPkg::Lock::Timeout="${APT_LOCK_TIMEOUT_SECONDS}" update -y
+  apt-get -o DPkg::Lock::Timeout="${APT_LOCK_TIMEOUT_SECONDS}" install -y --no-install-recommends \
     ca-certificates curl openssl tar gzip iproute2 jq libcap2-bin
   ok "Зависимости установлены."
 }
