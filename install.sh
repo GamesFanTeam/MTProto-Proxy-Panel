@@ -2,8 +2,8 @@
 set -Eeuo pipefail
 umask 027
 
-APP_VERSION="1.3.3-clean"
-TELEMT_VERSION="3.4.13"
+APP_VERSION="1.4.1-clean"
+TELEMT_VERSION="3.4.14"
 XRAY_VERSION="v26.6.1"
 PANEL_PORT="8787"
 TLS_DOMAIN="max.ru"
@@ -292,6 +292,8 @@ config.update({
 config.setdefault('telemt_auth_header', auth_match.group(1) if auth_match else os.environ['PANEL_API_AUTH'])
 config.setdefault('tls_domain', tls_match.group(1) if tls_match else os.environ['PANEL_TLS_DOMAIN'])
 config.setdefault('cascade', None)
+config.setdefault('cascade_profiles', [])
+config.setdefault('active_cascade_profile', None)
 
 if 'password_salt' not in config or 'password_hash' not in config:
     salt = secrets.token_bytes(16)
@@ -345,6 +347,7 @@ XRAY_CONFIG_BACKUP = Path('/etc/xray-cascade/client.json.bak')
 SESSIONS: dict[str, dict[str, Any]] = {}
 SESSION_TTL = 12 * 60 * 60
 USERNAME_RE = re.compile(r'^[A-Za-z0-9_.-]{1,64}$')
+PROFILE_RE = re.compile(r'^[A-Za-z0-9_. -]{1,64}$')
 SID_RE = re.compile(r'^[0-9a-fA-F]{0,16}$')
 ALLOWED_FP = {'chrome', 'firefox', 'safari', 'ios', 'android', 'edge', '360', 'qq', 'random'}
 SYSTEMCTL_TIMEOUT = 4.0
@@ -652,8 +655,76 @@ def parse_vless_reality_uri(uri: str) -> tuple[dict[str, Any], dict[str, str]]:
     return config, summary
 
 
-def apply_cascade(vless_uri: str) -> str:
+
+def sanitize_profile_name(value: str, summary: dict[str, str]) -> str:
+    name = value.strip()
+    if not name:
+        name = f"{summary.get('endpoint', 'vless')} {summary.get('security', '-')}/{summary.get('network', '-')}"[:64]
+    if not PROFILE_RE.fullmatch(name):
+        raise ValueError('Имя профиля: 1–64 символа A-Z, a-z, 0-9, пробел, _, . или -')
+    return name
+
+
+def upsert_cascade_profile(settings: dict[str, Any], name: str, summary: dict[str, str], vless_uri: str) -> None:
+    profiles = settings.get('cascade_profiles')
+    if not isinstance(profiles, list):
+        profiles = []
+    entry = {
+        'name': name,
+        'summary': summary,
+        'vless_uri': vless_uri.strip(),
+        'updated_at': int(time.time()),
+    }
+    for index, profile in enumerate(profiles):
+        if isinstance(profile, dict) and profile.get('name') == name:
+            profiles[index] = entry
+            break
+    else:
+        profiles.append(entry)
+    settings['cascade_profiles'] = profiles[-30:]
+    settings['active_cascade_profile'] = name
+    settings['cascade'] = summary
+
+
+def find_cascade_profile(settings: dict[str, Any], name: str) -> dict[str, Any]:
+    name = name.strip()
+    for profile in settings.get('cascade_profiles') or []:
+        if isinstance(profile, dict) and profile.get('name') == name:
+            return profile
+    raise ValueError(f'VLESS-профиль не найден: {name}')
+
+
+def switch_cascade_profile(name: str) -> str:
+    settings = load_settings()
+    profile = find_cascade_profile(settings, name)
+    uri = str(profile.get('vless_uri') or '')
+    if not uri:
+        raise ValueError(f'В профиле {name} нет сохранённого VLESS URI')
+    return apply_cascade(uri, name)
+
+
+def delete_cascade_profile(name: str) -> str:
+    name = name.strip()
+    settings = load_settings()
+    old_profiles = settings.get('cascade_profiles') or []
+    profiles = [p for p in old_profiles if not (isinstance(p, dict) and p.get('name') == name)]
+    if len(profiles) == len(old_profiles):
+        raise ValueError(f'VLESS-профиль не найден: {name}')
+    was_active = settings.get('active_cascade_profile') == name
+    settings['cascade_profiles'] = profiles
+    if was_active:
+        settings['active_cascade_profile'] = None
+        settings['cascade'] = None
+        save_settings(settings)
+        disable_cascade()
+        return f'Активный VLESS-профиль {name} удалён, каскад остановлен fail-closed.'
+    save_settings(settings)
+    return f'VLESS-профиль {name} удалён.'
+
+
+def apply_cascade(vless_uri: str, profile_name: str = '') -> str:
     config, summary = parse_vless_reality_uri(vless_uri)
+    profile_name = sanitize_profile_name(profile_name, summary)
     XRAY_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix='client.', suffix='.json', dir=str(XRAY_CONFIG_PATH.parent))
     try:
@@ -676,9 +747,9 @@ def apply_cascade(vless_uri: str) -> str:
             raise RuntimeError('Не удалось запустить telemt: ' + telemt_result.stderr[-400:])
 
         settings = load_settings()
-        settings['cascade'] = summary
+        upsert_cascade_profile(settings, profile_name, summary, vless_uri)
         save_settings(settings)
-        return f"VLESS-каскад применён: {summary['endpoint']} / {summary['security']} / {summary['network']} / SNI {summary['sni']}. Проверка readiness может занять до минуты."
+        return f"VLESS-профиль «{profile_name}» применён: {summary['endpoint']} / {summary['security']} / {summary['network']} / SNI {summary['sni']}. Проверка readiness может занять до минуты."
     except Exception:
         try:
             os.unlink(tmp_name)
@@ -700,8 +771,9 @@ def disable_cascade() -> str:
         XRAY_CONFIG_PATH.replace(disabled_path)
     settings = load_settings()
     settings['cascade'] = None
+    settings['active_cascade_profile'] = None
     save_settings(settings)
-    return 'Каскад выключен. telemt остановлен fail-closed: клиентские ссылки не будут подключаться до нового каскада.'
+    return 'Каскад выключен. telemt остановлен fail-closed: сохранённые VLESS-профили остались в списке.'
 
 
 TLS_DOMAIN_RE = re.compile(r'^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$')
@@ -885,7 +957,7 @@ def collect_proxy_links(user: dict[str, Any], settings: dict[str, Any]) -> list[
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'MTProxyPanel/1.3.3'
+    server_version = 'MTProxyPanel/1.4.1'
 
     def setup(self) -> None:
         super().setup()
@@ -963,7 +1035,13 @@ class Handler(BaseHTTPRequestHandler):
                 SESSIONS.pop(token, None)
                 self.redirect('/login', 'panel_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'); return
             if self.path == '/cascade/apply':
-                start_operation('Применение VLESS-каскада', apply_cascade, form.get('vless_uri', ''))
+                start_operation('Применение VLESS-профиля', apply_cascade, form.get('vless_uri', ''), form.get('profile_name', ''))
+                self.redirect('/'); return
+            if self.path == '/cascade/switch':
+                start_operation('Переключение VLESS-профиля', switch_cascade_profile, form.get('profile_name', ''))
+                self.redirect('/'); return
+            if self.path == '/cascade/delete':
+                start_operation('Удаление VLESS-профиля', delete_cascade_profile, form.get('profile_name', ''))
                 self.redirect('/'); return
             if self.path == '/cascade/disable':
                 start_operation('Остановка каскада', disable_cascade)
@@ -1055,8 +1133,19 @@ class Handler(BaseHTTPRequestHandler):
         ingress_local_ok = tcp_probe('127.0.0.1', 443)
         cascade_text = 'не настроен' if not cascade else f"{esc(cascade['endpoint'])} / {esc(cascade.get('security', '-'))} / {esc(cascade.get('network', '-'))} / SNI {esc(cascade.get('sni', '-'))} / fp {esc(cascade.get('fingerprint', '-'))}{recovered_note}"
         status = f'''<div class="card"><h2>Состояние маршрута</h2><div class="row"><span class="pill">Xray cascade: <span class="{'ok' if xray_up else 'bad'}">{'ACTIVE' if xray_up else 'OFF'}</span></span><span class="pill">telemt: <span class="{'ok' if telemt_up else 'bad'}">{'ACTIVE' if telemt_up else 'OFF'}</span></span><span class="pill">Local :443: <span class="{'ok' if ingress_local_ok else 'bad'}">{'LISTEN' if ingress_local_ok else 'CLOSED'}</span></span><span class="pill">Server → Telegram: <span class="{'ok' if ready_ok else 'bad'}">{'READY' if ready_ok else 'NOT READY'}</span></span><span class="pill">External client test: <span class="warn">CHECK MANUALLY</span></span></div><p class="muted">Каскад: {cascade_text}</p><p class="hint muted"><b>Важно:</b> зелёный <code>Server → Telegram</code> доказывает только серверный маршрут telemt → VLESS → Telegram DC. Он не доказывает внешний вход: Telegram-клиент из РФ должен сам пройти участок <code>клиент → {esc(settings['public_host'])}:443 / Fake TLS</code>. Если в Telegram нет соединения при зелёных статусах, проверяйте внешний TCP 443, актуальный secret после смены SNI и блокировку Fake TLS/SNI оператором.</p></div>'''
-        cascade_badge = '<p class="bad">VLESS ключ не добавлен</p>' if not cascade else f'''<p class="ok">VLESS ключ добавлен</p><p class="hint muted"><b>Активный ключ:</b><br>endpoint: <code>{esc(cascade.get('endpoint', '-'))}</code><br>security/type: <code>{esc(cascade.get('security', '-'))}/{esc(cascade.get('network', '-'))}</code><br>SNI: <code>{esc(cascade.get('sni', '-'))}</code><br>flow: <code>{esc(cascade.get('flow', 'none'))}</code></p>'''
-        cascade_form = f'''<div class="card"><h2>VLESS каскад</h2>{cascade_badge}<p class="muted">Вставьте клиентскую VLESS-ссылку EGRESS-сервера. Можно вставлять VLESS-ссылки разных панелей: REALITY/TLS/none и raw/tcp/ws/grpc/httpupgrade/xhttp/http. Панель не требует sni/pbk заранее; итоговую валидность проверяет Xray. Она преобразуется в локальный Xray outbound; telemt направляет MTProto-трафик через SOCKS5.</p><form method="post" action="/cascade/apply"><input type="hidden" name="csrf" value="{csrf}"><label>VLESS URL</label><textarea name="vless_uri" placeholder="vless://UUID@host:443?... любой common VLESS share-link" required></textarea><button type="submit">Применить VLESS каскад</button></form><form method="post" action="/cascade/disable" style="margin-top:12px"><input type="hidden" name="csrf" value="{csrf}"><button class="danger" type="submit">Остановить каскад</button></form></div>'''
+        active_profile = settings.get('active_cascade_profile') or '-'
+        cascade_badge = '<p class="bad">VLESS профиль не выбран</p>' if not cascade else f'''<p class="ok">Активный VLESS профиль: {esc(active_profile)}</p><p class="hint muted"><b>Текущий маршрут:</b><br>endpoint: <code>{esc(cascade.get('endpoint', '-'))}</code><br>security/type: <code>{esc(cascade.get('security', '-'))}/{esc(cascade.get('network', '-'))}</code><br>SNI: <code>{esc(cascade.get('sni', '-'))}</code><br>flow: <code>{esc(cascade.get('flow', 'none'))}</code></p>'''
+        profile_rows = ''
+        for profile in settings.get('cascade_profiles') or []:
+            if not isinstance(profile, dict):
+                continue
+            profile_name = str(profile.get('name') or '')
+            summary = profile.get('summary') or {}
+            active_mark = ' ✓ активен' if profile_name == active_profile else ''
+            profile_rows += f'''<div class="user"><b>{esc(profile_name)}{active_mark}</b><p class="hint muted">{esc(summary.get('endpoint', '-'))} / {esc(summary.get('security', '-'))}/{esc(summary.get('network', '-'))} / SNI {esc(summary.get('sni', '-'))}</p><form class="inline" method="post" action="/cascade/switch"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="profile_name" value="{esc(profile_name)}"><button class="secondary" type="submit">Включить</button></form> <form class="inline" method="post" action="/cascade/delete"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="profile_name" value="{esc(profile_name)}"><button class="danger" type="submit">Удалить</button></form></div>'''
+        if not profile_rows:
+            profile_rows = '<p class="muted">VLESS-профилей пока нет.</p>'
+        cascade_form = f'''<div class="card"><h2>VLESS каскады</h2>{cascade_badge}<p class="muted">Добавляйте несколько VLESS-ключей и переключайтесь между ними для проверки разных EGRESS/transport-вариантов. Поддерживаются common-ссылки: REALITY/TLS/none и raw/tcp/ws/grpc/httpupgrade/xhttp/http. Итоговую валидность проверяет Xray.</p><form method="post" action="/cascade/apply"><input type="hidden" name="csrf" value="{csrf}"><label>Название профиля</label><input name="profile_name" placeholder="egress-1 reality raw"><label>VLESS URL</label><textarea name="vless_uri" placeholder="vless://UUID@host:443?... любой common VLESS share-link" required></textarea><button type="submit">Сохранить и включить VLESS профиль</button></form><h3 style="margin-top:18px">Сохранённые профили</h3>{profile_rows}<form method="post" action="/cascade/disable" style="margin-top:12px"><input type="hidden" name="csrf" value="{csrf}"><button class="danger" type="submit">Остановить каскад</button></form></div>'''
         settings_card = f'''<div class="card"><h2>Настройки Proxy</h2><p class="muted">Домен в ссылках задан при установке: <code>{esc(settings['public_host'])}</code>. Здесь меняются параметры, которые не должны спрашиваться в installer.</p><form method="post" action="/settings/tls-domain"><input type="hidden" name="csrf" value="{csrf}"><label>Fake TLS SNI для tg://proxy ссылок</label><input name="tls_domain" value="{esc(settings['tls_domain'])}" placeholder="max.ru" required><button type="submit">Сохранить SNI</button></form><hr style="border:0;border-top:1px solid var(--line);margin:18px 0"><form method="post" action="/settings/password"><input type="hidden" name="csrf" value="{csrf}"><label>Текущий пароль администратора</label><input type="password" name="current_password" required><label>Новый пароль администратора</label><input type="password" name="new_password" minlength="12" required><label>Подтверждение нового пароля</label><input type="password" name="confirm_password" minlength="12" required><button type="submit">Сменить пароль</button></form></div>'''
         user_rows = ''
         link_index = 0
@@ -1168,7 +1257,7 @@ cat <<EOF
 
 Установлено:
   Panel:  v${APP_VERSION}, 0.0.0.0:${PANEL_PORT}
-  telemt: ${TELEMT_VERSION} (pinned; пока остановлен до настройки каскада)
+  telemt: ${TELEMT_VERSION} (pinned; релиз 3.4.14 с JA3/JA4 диагностикой; пока остановлен до настройки каскада)
   Xray:   ${XRAY_VERSION} (pinned; пока остановлен до настройки каскада)
 
 Адрес в tg://proxy ссылках: ${PUBLIC_HOST}:443
@@ -1194,8 +1283,8 @@ $(if [[ "$EXISTING_PANEL_SETTINGS" -eq 1 ]]; then
 Первый запуск:
   1) Откройте панель по адресу http://IP_СЕРВЕРА:${PANEL_PORT}.
   2) В UI проверьте Fake TLS SNI max.ru и смените временный пароль администратора.
-  3) Вставьте VLESS-ссылку зарубежного EGRESS VPS.
-  4) Дождитесь статуса Telegram upstream: READY.
+  3) Добавьте один или несколько VLESS-профилей зарубежных EGRESS VPS.
+  4) Переключайтесь между VLESS-профилями и дождитесь Server → Telegram: READY.
   5) Создавайте клиентские доступы; панель выдаст tg://proxy ссылки.
 
 Схема маршрута:
