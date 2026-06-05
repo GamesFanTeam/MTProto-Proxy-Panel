@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 027
 
-APP_VERSION="1.3.0-clean"
+APP_VERSION="1.3.1-clean"
 TELEMT_VERSION="3.4.13"
 XRAY_VERSION="v26.6.1"
 PANEL_PORT="8787"
@@ -807,7 +807,7 @@ def render_layout(content: str, title: str = 'MTProxy Panel') -> bytes:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'MTProxyPanel/1.2.2'
+    server_version = 'MTProxyPanel/1.3.1'
 
     def setup(self) -> None:
         super().setup()
@@ -835,6 +835,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers(); self.wfile.write(body)
 
     def redirect(self, path: str, cookie: str | None = None) -> None:
+        # PRG: every POST returns 303 -> GET, so browser refresh never asks to resend form data.
         self.send_response(303); self.send_header('Location', path)
         if cookie:
             self.send_header('Set-Cookie', cookie)
@@ -868,7 +869,7 @@ class Handler(BaseHTTPRequestHandler):
                 token, _ = create_session()
                 self.redirect('/', f'panel_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL}')
             else:
-                self.login_page('Неверный пароль')
+                self.redirect('/login')
             return
         auth = self.require_auth()
         if not auth:
@@ -876,26 +877,30 @@ class Handler(BaseHTTPRequestHandler):
         token, session = auth
         form = self.read_form()
         if not self.check_csrf(form, session):
-            self.dashboard(session, error='CSRF-проверка не пройдена'); return
+            with OPERATION_LOCK:
+                OPERATION_STATE.update({'running': False, 'message': '', 'error': 'CSRF-проверка не пройдена', 'updated_at': time.time()})
+            self.redirect('/'); return
         try:
             if self.path == '/logout':
                 SESSIONS.pop(token, None)
                 self.redirect('/login', 'panel_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'); return
             if self.path == '/cascade/apply':
-                msg = start_operation('Применение REALITY-каскада', apply_cascade, form.get('vless_uri', ''))
-                self.dashboard(session, message=msg); return
+                start_operation('Применение VLESS-каскада', apply_cascade, form.get('vless_uri', ''))
+                self.redirect('/'); return
             if self.path == '/cascade/disable':
-                msg = start_operation('Остановка каскада', disable_cascade)
-                self.dashboard(session, message=msg); return
+                start_operation('Остановка каскада', disable_cascade)
+                self.redirect('/'); return
             if self.path == '/settings/tls-domain':
-                msg = start_operation('Смена Fake TLS SNI', apply_tls_domain, form.get('tls_domain', ''))
-                self.dashboard(session, message=msg); return
+                start_operation('Смена Fake TLS SNI', apply_tls_domain, form.get('tls_domain', ''))
+                self.redirect('/'); return
             if self.path == '/settings/password':
-                self.dashboard(session, message=apply_admin_password(
-                    form.get('current_password', ''),
-                    form.get('new_password', ''),
-                    form.get('confirm_password', ''),
-                )); return
+                with OPERATION_LOCK:
+                    OPERATION_STATE.update({'running': False, 'message': apply_admin_password(
+                        form.get('current_password', ''),
+                        form.get('new_password', ''),
+                        form.get('confirm_password', ''),
+                    ), 'error': '', 'updated_at': time.time()})
+                self.redirect('/'); return
             if self.path == '/users/create':
                 username = form.get('username', '').strip()
                 if not USERNAME_RE.fullmatch(username):
@@ -906,9 +911,13 @@ class Handler(BaseHTTPRequestHandler):
                 problem = response.get('error', response) if isinstance(response, dict) else response
                 if status not in (201, 202):
                     if isinstance(problem, dict) and problem.get('code') == 'user_exists':
-                        self.dashboard(session, message=f'Доступ {username} уже существует. Используйте ссылку ниже или обновите secret.'); return
+                        with OPERATION_LOCK:
+                            OPERATION_STATE.update({'running': False, 'message': f'Доступ {username} уже существует. Используйте ссылку ниже или обновите secret.', 'error': '', 'updated_at': time.time()})
+                        self.redirect('/'); return
                     raise ValueError('telemt не создал пользователя: ' + str(problem))
-                self.dashboard(session, message=f'Доступ {username} создан. Ссылка появилась в списке ниже.'); return
+                with OPERATION_LOCK:
+                    OPERATION_STATE.update({'running': False, 'message': f'Доступ {username} создан. Ссылка появилась в списке ниже.', 'error': '', 'updated_at': time.time()})
+                self.redirect('/'); return
             if self.path == '/users/delete':
                 username = form.get('username', '')
                 if username == 'bootstrap':
@@ -916,16 +925,22 @@ class Handler(BaseHTTPRequestHandler):
                 status, response = telemt_request('/v1/users/' + urllib.parse.quote(username), 'DELETE', timeout=API_WRITE_TIMEOUT)
                 if status not in (200, 202):
                     raise ValueError('telemt не удалил пользователя: ' + str(response.get('error', response)))
-                self.dashboard(session, message=f'Доступ {username} удалён.'); return
+                with OPERATION_LOCK:
+                    OPERATION_STATE.update({'running': False, 'message': f'Доступ {username} удалён.', 'error': '', 'updated_at': time.time()})
+                self.redirect('/'); return
             if self.path == '/users/rotate':
                 username = form.get('username', '')
                 status, response = telemt_request('/v1/users/' + urllib.parse.quote(username) + '/rotate-secret', 'POST', {}, timeout=API_WRITE_TIMEOUT)
                 if status not in (200, 202):
                     raise ValueError('telemt не обновил secret: ' + str(response.get('error', response)))
-                self.dashboard(session, message=f'Secret пользователя {username} обновлён; старая ссылка больше не действует.'); return
+                with OPERATION_LOCK:
+                    OPERATION_STATE.update({'running': False, 'message': f'Secret пользователя {username} обновлён; старая ссылка больше не действует.', 'error': '', 'updated_at': time.time()})
+                self.redirect('/'); return
             self.send_error(404)
         except Exception as exc:
-            self.dashboard(session, error=str(exc))
+            with OPERATION_LOCK:
+                OPERATION_STATE.update({'running': False, 'message': '', 'error': str(exc), 'updated_at': time.time()})
+            self.redirect('/')
 
     def login_page(self, error: str | None = None) -> None:
         flash = f'<div class="flash error">{esc(error)}</div>' if error else ''
@@ -962,7 +977,8 @@ class Handler(BaseHTTPRequestHandler):
         ingress_local_ok = tcp_probe('127.0.0.1', 443)
         cascade_text = 'не настроен' if not cascade else f"{esc(cascade['endpoint'])} / {esc(cascade.get('security', '-'))} / {esc(cascade.get('network', '-'))} / SNI {esc(cascade.get('sni', '-'))} / fp {esc(cascade.get('fingerprint', '-'))}{recovered_note}"
         status = f'''<div class="card"><h2>Состояние маршрута</h2><div class="row"><span class="pill">Xray cascade: <span class="{'ok' if xray_up else 'bad'}">{'ACTIVE' if xray_up else 'OFF'}</span></span><span class="pill">telemt: <span class="{'ok' if telemt_up else 'bad'}">{'ACTIVE' if telemt_up else 'OFF'}</span></span><span class="pill">Local :443: <span class="{'ok' if ingress_local_ok else 'bad'}">{'LISTEN' if ingress_local_ok else 'CLOSED'}</span></span><span class="pill">Server → Telegram: <span class="{'ok' if ready_ok else 'bad'}">{'READY' if ready_ok else 'NOT READY'}</span></span><span class="pill">Client → Proxy: <span class="warn">UNKNOWN</span></span></div><p class="muted">Каскад: {cascade_text}</p><p class="hint muted"><b>Важно:</b> зелёный <code>Server → Telegram</code> доказывает только серверный маршрут telemt → VLESS → Telegram DC. Он не доказывает, что Telegram-клиент из РФ может пройти входной участок <code>клиент → {esc(settings['public_host'])}:443 / Fake TLS</code>. Если в Telegram нет соединения при зелёных статусах, проверяйте внешний TCP 443, актуальный secret после смены SNI и блокировку Fake TLS/SNI оператором.</p></div>'''
-        cascade_form = f'''<div class="card"><h2>VLESS каскад</h2><p class="muted">Вставьте клиентскую VLESS-ссылку EGRESS-сервера. Поддерживаются common-варианты: REALITY/TLS/none и raw/tcp/ws/grpc/httpupgrade/xhttp/http. Она преобразуется в локальный Xray outbound; telemt направляет MTProto-трафик через SOCKS5.</p><form method="post" action="/cascade/apply"><input type="hidden" name="csrf" value="{csrf}"><label>VLESS URL</label><textarea name="vless_uri" placeholder="vless://UUID@host:443?security=reality&type=tcp&sni=...&fp=chrome&pbk=...&sid=... или vless://UUID@host:443?security=tls&type=ws&host=...&path=/..." required></textarea><button type="submit">Применить VLESS каскад</button></form><form method="post" action="/cascade/disable" style="margin-top:12px"><input type="hidden" name="csrf" value="{csrf}"><button class="danger" type="submit">Остановить каскад</button></form></div>'''
+        cascade_badge = '<p class="bad">VLESS ключ не добавлен</p>' if not cascade else f'''<p class="ok">VLESS ключ добавлен</p><p class="hint muted"><b>Активный ключ:</b><br>endpoint: <code>{esc(cascade.get('endpoint', '-'))}</code><br>security/type: <code>{esc(cascade.get('security', '-'))}/{esc(cascade.get('network', '-'))}</code><br>SNI: <code>{esc(cascade.get('sni', '-'))}</code><br>flow: <code>{esc(cascade.get('flow', 'none'))}</code></p>'''
+        cascade_form = f'''<div class="card"><h2>VLESS каскад</h2>{cascade_badge}<p class="muted">Вставьте клиентскую VLESS-ссылку EGRESS-сервера. Поддерживаются common-варианты: REALITY/TLS/none и raw/tcp/ws/grpc/httpupgrade/xhttp/http. Она преобразуется в локальный Xray outbound; telemt направляет MTProto-трафик через SOCKS5.</p><form method="post" action="/cascade/apply"><input type="hidden" name="csrf" value="{csrf}"><label>VLESS URL</label><textarea name="vless_uri" placeholder="vless://UUID@host:443?security=reality&type=tcp&sni=...&fp=chrome&pbk=...&sid=... или vless://UUID@host:443?security=tls&type=ws&host=...&path=/..." required></textarea><button type="submit">Применить VLESS каскад</button></form><form method="post" action="/cascade/disable" style="margin-top:12px"><input type="hidden" name="csrf" value="{csrf}"><button class="danger" type="submit">Остановить каскад</button></form></div>'''
         settings_card = f'''<div class="card"><h2>Настройки Proxy</h2><p class="muted">Домен в ссылках задан при установке: <code>{esc(settings['public_host'])}</code>. Здесь меняются параметры, которые не должны спрашиваться в installer.</p><form method="post" action="/settings/tls-domain"><input type="hidden" name="csrf" value="{csrf}"><label>Fake TLS SNI для tg://proxy ссылок</label><input name="tls_domain" value="{esc(settings['tls_domain'])}" placeholder="vk.com" required><button type="submit">Сохранить SNI</button></form><hr style="border:0;border-top:1px solid var(--line);margin:18px 0"><form method="post" action="/settings/password"><input type="hidden" name="csrf" value="{csrf}"><label>Текущий пароль администратора</label><input type="password" name="current_password" required><label>Новый пароль администратора</label><input type="password" name="new_password" minlength="12" required><label>Подтверждение нового пароля</label><input type="password" name="confirm_password" minlength="12" required><button type="submit">Сменить пароль</button></form></div>'''
         user_rows = ''
         link_index = 0
