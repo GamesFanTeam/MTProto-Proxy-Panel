@@ -2,11 +2,11 @@
 set -Eeuo pipefail
 umask 027
 
-APP_VERSION="1.3.1-clean"
+APP_VERSION="1.3.3-clean"
 TELEMT_VERSION="3.4.13"
 XRAY_VERSION="v26.6.1"
 PANEL_PORT="8787"
-TLS_DOMAIN="vk.com"
+TLS_DOMAIN="max.ru"
 PUBLIC_HOST=""
 ADMIN_PASSWORD=""
 
@@ -43,7 +43,7 @@ clean_previous_installation() {
 
 printf '\n\033[1;36mMTProxy Telemt + REALITY Cascade Panel v%s\033[0m\n' "$APP_VERSION"
 printf 'Схема: Telegram -> telemt -> Xray SOCKS5 -> VLESS+REALITY cascade -> Telegram DC\n\n'
-printf 'UI после установки: http://IP_СЕРВЕРА:8787 (логин admin, пароль появится в терминале)\n\n'
+printf 'UI после установки будет выведен готовыми ссылками по IP и домену. Логин admin, пароль появится в терминале.\n\n'
 while true; do
   IFS= read -r -p "Введите домен прокси для tg://proxy ссылок (например proxy.example.ru): " PUBLIC_HOST </dev/tty \
     || die "Не удалось прочитать домен"
@@ -543,10 +543,13 @@ def parse_vless_reality_uri(uri: str) -> tuple[dict[str, Any], dict[str, str]]:
     alpn = split_csv(query.get('alpn'))
 
     if security == 'reality':
-        if not sni or not public_key:
-            raise ValueError('Для VLESS REALITY обязательны параметры sni и pbk/publicKey')
+        # Do not hard-reject partial REALITY links in the UI. Different panels/exporters
+        # use different field names, and some links are intentionally minimal.
+        # Xray's config test remains the source of truth for whether the link is usable.
         if not SID_RE.fullmatch(short_id) or len(short_id) % 2:
             raise ValueError('sid/shortId должен быть hex-строкой чётной длины до 16 символов')
+        if not sni:
+            sni = host_header or parsed.hostname
     if security == 'tls' and not sni:
         sni = host_header or parsed.hostname
 
@@ -567,13 +570,16 @@ def parse_vless_reality_uri(uri: str) -> tuple[dict[str, Any], dict[str, str]]:
         stream_settings['security'] = security
 
     if security == 'reality':
-        stream_settings['realitySettings'] = {
+        reality_settings: dict[str, Any] = {
             'serverName': sni,
             'fingerprint': fingerprint,
-            'password': public_key,
-            'shortId': short_id,
             'spiderX': spider_x,
         }
+        if public_key:
+            reality_settings['password'] = public_key
+        if short_id:
+            reality_settings['shortId'] = short_id
+        stream_settings['realitySettings'] = reality_settings
     elif security == 'tls':
         tls_settings: dict[str, Any] = {
             'serverName': sni,
@@ -806,8 +812,80 @@ def render_layout(content: str, title: str = 'MTProxy Panel') -> bytes:
     return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)}</title><style>{style}</style>{script}</head><body><main>{content}</main></body></html>'''.encode('utf-8')
 
 
+def domain_hex(domain: str) -> str:
+    return domain.encode('utf-8').hex()
+
+
+def normalize_proxy_secret(raw: Any, tls_domain: str) -> str | None:
+    value = str(raw or '').strip()
+    if not value:
+        return None
+    if value.startswith(('tg://proxy?', 'https://t.me/proxy?', 'http://t.me/proxy?')):
+        return value
+    value = value.strip('"').strip("'")
+    clean = re.sub(r'\s+', '', value)
+    if clean.startswith('ee'):
+        return clean
+    if re.fullmatch(r'[0-9a-fA-F]+', clean):
+        suffix = domain_hex(tls_domain)
+        if clean.lower().endswith(suffix.lower()):
+            return 'ee' + clean
+        if len(clean) >= 32:
+            return 'ee' + clean + suffix
+    return value
+
+
+def proxy_url_from_secret(secret_or_url: str, public_host: str) -> str:
+    if secret_or_url.startswith(('tg://proxy?', 'https://t.me/proxy?', 'http://t.me/proxy?')):
+        return secret_or_url
+    return 'tg://proxy?' + urllib.parse.urlencode({
+        'server': public_host,
+        'port': '443',
+        'secret': secret_or_url,
+    })
+
+
+def collect_proxy_links(user: dict[str, Any], settings: dict[str, Any]) -> list[str]:
+    candidates: list[Any] = []
+
+    def collect(value: Any) -> None:
+        if not value:
+            return
+        if isinstance(value, str):
+            candidates.append(value)
+        elif isinstance(value, dict):
+            for key in ('url', 'link', 'proxy', 'tg', 'tls', 'ee_tls', 'secret', 'value'):
+                if key in value:
+                    collect(value[key])
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+
+    links = user.get('links') or {}
+    collect(links.get('tls'))
+    collect(links.get('ee_tls'))
+    collect(links.get('proxy'))
+    collect(links)
+    for key in ('tls_secret', 'ee_secret', 'secret', 'secret_hex'):
+        if key in user:
+            collect(user[key])
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        secret = normalize_proxy_secret(candidate, settings.get('tls_domain', 'max.ru'))
+        if not secret:
+            continue
+        url = proxy_url_from_secret(secret, settings.get('public_host', ''))
+        if url not in seen:
+            result.append(url)
+            seen.add(url)
+    return result
+
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'MTProxyPanel/1.3.1'
+    server_version = 'MTProxyPanel/1.3.3'
 
     def setup(self) -> None:
         super().setup()
@@ -976,27 +1054,27 @@ class Handler(BaseHTTPRequestHandler):
         recovered_note = ' (восстановлено из Xray config)' if cascade and recovered else ''
         ingress_local_ok = tcp_probe('127.0.0.1', 443)
         cascade_text = 'не настроен' if not cascade else f"{esc(cascade['endpoint'])} / {esc(cascade.get('security', '-'))} / {esc(cascade.get('network', '-'))} / SNI {esc(cascade.get('sni', '-'))} / fp {esc(cascade.get('fingerprint', '-'))}{recovered_note}"
-        status = f'''<div class="card"><h2>Состояние маршрута</h2><div class="row"><span class="pill">Xray cascade: <span class="{'ok' if xray_up else 'bad'}">{'ACTIVE' if xray_up else 'OFF'}</span></span><span class="pill">telemt: <span class="{'ok' if telemt_up else 'bad'}">{'ACTIVE' if telemt_up else 'OFF'}</span></span><span class="pill">Local :443: <span class="{'ok' if ingress_local_ok else 'bad'}">{'LISTEN' if ingress_local_ok else 'CLOSED'}</span></span><span class="pill">Server → Telegram: <span class="{'ok' if ready_ok else 'bad'}">{'READY' if ready_ok else 'NOT READY'}</span></span><span class="pill">Client → Proxy: <span class="warn">UNKNOWN</span></span></div><p class="muted">Каскад: {cascade_text}</p><p class="hint muted"><b>Важно:</b> зелёный <code>Server → Telegram</code> доказывает только серверный маршрут telemt → VLESS → Telegram DC. Он не доказывает, что Telegram-клиент из РФ может пройти входной участок <code>клиент → {esc(settings['public_host'])}:443 / Fake TLS</code>. Если в Telegram нет соединения при зелёных статусах, проверяйте внешний TCP 443, актуальный secret после смены SNI и блокировку Fake TLS/SNI оператором.</p></div>'''
+        status = f'''<div class="card"><h2>Состояние маршрута</h2><div class="row"><span class="pill">Xray cascade: <span class="{'ok' if xray_up else 'bad'}">{'ACTIVE' if xray_up else 'OFF'}</span></span><span class="pill">telemt: <span class="{'ok' if telemt_up else 'bad'}">{'ACTIVE' if telemt_up else 'OFF'}</span></span><span class="pill">Local :443: <span class="{'ok' if ingress_local_ok else 'bad'}">{'LISTEN' if ingress_local_ok else 'CLOSED'}</span></span><span class="pill">Server → Telegram: <span class="{'ok' if ready_ok else 'bad'}">{'READY' if ready_ok else 'NOT READY'}</span></span><span class="pill">External client test: <span class="warn">CHECK MANUALLY</span></span></div><p class="muted">Каскад: {cascade_text}</p><p class="hint muted"><b>Важно:</b> зелёный <code>Server → Telegram</code> доказывает только серверный маршрут telemt → VLESS → Telegram DC. Он не доказывает внешний вход: Telegram-клиент из РФ должен сам пройти участок <code>клиент → {esc(settings['public_host'])}:443 / Fake TLS</code>. Если в Telegram нет соединения при зелёных статусах, проверяйте внешний TCP 443, актуальный secret после смены SNI и блокировку Fake TLS/SNI оператором.</p></div>'''
         cascade_badge = '<p class="bad">VLESS ключ не добавлен</p>' if not cascade else f'''<p class="ok">VLESS ключ добавлен</p><p class="hint muted"><b>Активный ключ:</b><br>endpoint: <code>{esc(cascade.get('endpoint', '-'))}</code><br>security/type: <code>{esc(cascade.get('security', '-'))}/{esc(cascade.get('network', '-'))}</code><br>SNI: <code>{esc(cascade.get('sni', '-'))}</code><br>flow: <code>{esc(cascade.get('flow', 'none'))}</code></p>'''
-        cascade_form = f'''<div class="card"><h2>VLESS каскад</h2>{cascade_badge}<p class="muted">Вставьте клиентскую VLESS-ссылку EGRESS-сервера. Поддерживаются common-варианты: REALITY/TLS/none и raw/tcp/ws/grpc/httpupgrade/xhttp/http. Она преобразуется в локальный Xray outbound; telemt направляет MTProto-трафик через SOCKS5.</p><form method="post" action="/cascade/apply"><input type="hidden" name="csrf" value="{csrf}"><label>VLESS URL</label><textarea name="vless_uri" placeholder="vless://UUID@host:443?security=reality&type=tcp&sni=...&fp=chrome&pbk=...&sid=... или vless://UUID@host:443?security=tls&type=ws&host=...&path=/..." required></textarea><button type="submit">Применить VLESS каскад</button></form><form method="post" action="/cascade/disable" style="margin-top:12px"><input type="hidden" name="csrf" value="{csrf}"><button class="danger" type="submit">Остановить каскад</button></form></div>'''
-        settings_card = f'''<div class="card"><h2>Настройки Proxy</h2><p class="muted">Домен в ссылках задан при установке: <code>{esc(settings['public_host'])}</code>. Здесь меняются параметры, которые не должны спрашиваться в installer.</p><form method="post" action="/settings/tls-domain"><input type="hidden" name="csrf" value="{csrf}"><label>Fake TLS SNI для tg://proxy ссылок</label><input name="tls_domain" value="{esc(settings['tls_domain'])}" placeholder="vk.com" required><button type="submit">Сохранить SNI</button></form><hr style="border:0;border-top:1px solid var(--line);margin:18px 0"><form method="post" action="/settings/password"><input type="hidden" name="csrf" value="{csrf}"><label>Текущий пароль администратора</label><input type="password" name="current_password" required><label>Новый пароль администратора</label><input type="password" name="new_password" minlength="12" required><label>Подтверждение нового пароля</label><input type="password" name="confirm_password" minlength="12" required><button type="submit">Сменить пароль</button></form></div>'''
+        cascade_form = f'''<div class="card"><h2>VLESS каскад</h2>{cascade_badge}<p class="muted">Вставьте клиентскую VLESS-ссылку EGRESS-сервера. Можно вставлять VLESS-ссылки разных панелей: REALITY/TLS/none и raw/tcp/ws/grpc/httpupgrade/xhttp/http. Панель не требует sni/pbk заранее; итоговую валидность проверяет Xray. Она преобразуется в локальный Xray outbound; telemt направляет MTProto-трафик через SOCKS5.</p><form method="post" action="/cascade/apply"><input type="hidden" name="csrf" value="{csrf}"><label>VLESS URL</label><textarea name="vless_uri" placeholder="vless://UUID@host:443?... любой common VLESS share-link" required></textarea><button type="submit">Применить VLESS каскад</button></form><form method="post" action="/cascade/disable" style="margin-top:12px"><input type="hidden" name="csrf" value="{csrf}"><button class="danger" type="submit">Остановить каскад</button></form></div>'''
+        settings_card = f'''<div class="card"><h2>Настройки Proxy</h2><p class="muted">Домен в ссылках задан при установке: <code>{esc(settings['public_host'])}</code>. Здесь меняются параметры, которые не должны спрашиваться в installer.</p><form method="post" action="/settings/tls-domain"><input type="hidden" name="csrf" value="{csrf}"><label>Fake TLS SNI для tg://proxy ссылок</label><input name="tls_domain" value="{esc(settings['tls_domain'])}" placeholder="max.ru" required><button type="submit">Сохранить SNI</button></form><hr style="border:0;border-top:1px solid var(--line);margin:18px 0"><form method="post" action="/settings/password"><input type="hidden" name="csrf" value="{csrf}"><label>Текущий пароль администратора</label><input type="password" name="current_password" required><label>Новый пароль администратора</label><input type="password" name="new_password" minlength="12" required><label>Подтверждение нового пароля</label><input type="password" name="confirm_password" minlength="12" required><button type="submit">Сменить пароль</button></form></div>'''
         user_rows = ''
         link_index = 0
         for user in users:
             username = user.get('username', '')
             if username == 'bootstrap':
                 continue
-            tls_links = (user.get('links') or {}).get('tls') or []
-            if tls_links:
+            proxy_links = collect_proxy_links(user, settings)
+            if proxy_links:
                 link_parts = []
-                for link in tls_links:
+                for link in proxy_links:
                     link_index += 1
                     element_id = f'proxy_link_{link_index}'
-                    link_parts.append(f'''<div class="copyline"><input id="{element_id}" readonly value="{esc(link)}"><button class="secondary" type="button" onclick="copyById('{element_id}')">Копировать</button></div>''')
+                    link_parts.append(f'''<div class="copyline"><input id="{element_id}" readonly value="{esc(link)}"><button class="secondary" type="button" onclick="copyById('{element_id}')">Копировать</button><a class="pill" href="{esc(link)}">Открыть Telegram</a></div>''')
                 link_html = ''.join(link_parts)
             else:
                 link_html = '<span class="muted">ссылка ещё не построена</span>'
-            user_rows += f'''<div class="user"><div class="row"><b>{esc(username)}</b><form class="inline" method="post" action="/users/rotate"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="username" value="{esc(username)}"><button class="secondary" type="submit">Новый secret</button></form><form class="inline" method="post" action="/users/delete"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="username" value="{esc(username)}"><button class="danger" type="submit">Удалить</button></form></div>{link_html}<p class="hint muted">После смены Fake TLS SNI обязательно нажмите «Новый secret» и копируйте новую ссылку.</p></div>'''
+            user_rows += f'''<div class="user"><div class="row"><b>{esc(username)}</b><form class="inline" method="post" action="/users/rotate"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="username" value="{esc(username)}"><button class="secondary" type="submit">Новый secret</button></form><form class="inline" method="post" action="/users/delete"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="username" value="{esc(username)}"><button class="danger" type="submit">Удалить</button></form></div>{link_html}<p class="hint muted">Копируйте именно полную tg://proxy ссылку. После смены Fake TLS SNI обязательно нажмите «Новый secret» и копируйте новую ссылку.</p></div>'''
         if not user_rows:
             user_rows = '<p class="muted">Клиентских доступов пока нет.</p>'
         users_card = f'''<div class="card"><h2>Доступы Telegram Proxy</h2><form method="post" action="/users/create"><input type="hidden" name="csrf" value="{csrf}"><label>Имя нового доступа</label><div class="row"><input style="flex:1;margin:6px 0" name="username" placeholder="client_001" pattern="[A-Za-z0-9_.-]{{1,64}}" required><button type="submit">Создать ссылку</button></div></form>{user_rows}</div>'''
@@ -1078,6 +1156,13 @@ log "9/10" "Проверяю установленные версии"
 /usr/local/bin/telemt --version 2>/dev/null || true
 /usr/local/bin/xray version | head -n 1 || true
 
+PANEL_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+if [[ -z "${PANEL_IP:-}" ]]; then
+  PANEL_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+fi
+PANEL_URL_BY_IP="http://${PANEL_IP:-IP_СЕРВЕРА}:${PANEL_PORT}"
+PANEL_URL_BY_DOMAIN="http://${PUBLIC_HOST}:${PANEL_PORT}"
+
 log "10/10" "Готово: установлен MTProxy ingress; дальнейшая настройка выполняется в UI"
 cat <<EOF
 
@@ -1087,12 +1172,14 @@ cat <<EOF
   Xray:   ${XRAY_VERSION} (pinned; пока остановлен до настройки каскада)
 
 Адрес в tg://proxy ссылках: ${PUBLIC_HOST}:443
-Стартовый Fake TLS SNI:    ${TLS_DOMAIN} (изменяется в UI)
+Стартовый Fake TLS SNI:    ${TLS_DOMAIN} (по умолчанию max.ru; изменяется в UI)
 
-Доступ к панели для проверки:
-  открыть в браузере: http://IP_СЕРВЕРА:${PANEL_PORT}
-  если используете cloud firewall/security group — откройте TCP ${PANEL_PORT} вручную.
-  ВАЖНО: это HTTP-доступ для тестирования; не оставляйте порт публичным для production.
+Доступ к панели для проверки — можно копировать прямо в браузер:
+  ${PANEL_URL_BY_IP}
+  ${PANEL_URL_BY_DOMAIN}
+
+Логин панели:
+  admin
 
 Пароль панели:
 $(if [[ "$EXISTING_PANEL_SETTINGS" -eq 1 ]]; then
@@ -1101,9 +1188,12 @@ $(if [[ "$EXISTING_PANEL_SETTINGS" -eq 1 ]]; then
     printf '  %s' "$ADMIN_PASSWORD"
   fi)
 
+Если используете cloud firewall/security group — откройте входящий TCP ${PANEL_PORT}.
+ВАЖНО: это HTTP-доступ для тестирования; не оставляйте порт публичным для production.
+
 Первый запуск:
   1) Откройте панель по адресу http://IP_СЕРВЕРА:${PANEL_PORT}.
-  2) В UI задайте Fake TLS SNI и смените временный пароль администратора.
+  2) В UI проверьте Fake TLS SNI max.ru и смените временный пароль администратора.
   3) Вставьте VLESS-ссылку зарубежного EGRESS VPS.
   4) Дождитесь статуса Telegram upstream: READY.
   5) Создавайте клиентские доступы; панель выдаст tg://proxy ссылки.
