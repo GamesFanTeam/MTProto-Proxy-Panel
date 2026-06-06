@@ -1,164 +1,267 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-umask 027
 
-APP_VERSION="1.4.1-clean"
-TELEMT_VERSION="3.4.14"
-XRAY_VERSION="v26.6.1"
-PANEL_PORT="8787"
-TLS_DOMAIN="max.ru"
-PUBLIC_HOST=""
-ADMIN_PASSWORD=""
+APP_DIR="/opt/telemt-cascade-panel"
+APP_USER="telecascade"
+APP_PORT="8080"
+SERVICE_NAME="telemt-cascade-panel"
+PANEL_SECRET="$(openssl rand -hex 24)"
+PUBLIC_IP="$(curl -4fsS https://api.ipify.org || hostname -I | awk '{print $1}')"
 
-log() { printf '\n\033[1;36m[%s]\033[0m %s\n' "$1" "$2"; }
-die() { printf '\n\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
-
-
-clean_previous_installation() {
-  log "CLEAN" "Останавливаю и удаляю старую установку"
-  systemctl stop mtproxy-panel.service telemt.service xray-cascade.service >/dev/null 2>&1 || true
-  systemctl disable mtproxy-panel.service telemt.service xray-cascade.service >/dev/null 2>&1 || true
-
-  rm -f /etc/systemd/system/mtproxy-panel.service
-  rm -f /etc/systemd/system/telemt.service
-  rm -f /etc/systemd/system/xray-cascade.service
-  rm -rf /etc/systemd/system/mtproxy-panel.service.d
-  systemctl daemon-reload >/dev/null 2>&1 || true
-
-  rm -rf /opt/mtproxy-panel
-  rm -rf /etc/mtproxy-panel
-  rm -rf /etc/telemt
-  rm -rf /etc/xray-cascade
-  rm -rf /var/lib/telemt
-  rm -rf /var/lib/xray-cascade
-
-  rm -f /usr/local/bin/telemt
-  rm -f /usr/local/bin/xray
-
-  log "CLEAN" "Старая установка удалена"
-}
-
-[[ ${EUID:-$(id -u)} -eq 0 ]] || die "Запустите установку командой: sudo bash install.sh"
-[[ $# -eq 0 ]] || die "Параметры запуска не требуются. Используйте: sudo bash install.sh"
-
-printf '\n\033[1;36mMTProxy Telemt + REALITY Cascade Panel v%s\033[0m\n' "$APP_VERSION"
-printf 'Схема: Telegram -> telemt -> Xray SOCKS5 -> VLESS+REALITY cascade -> Telegram DC\n\n'
-printf 'UI после установки будет выведен готовыми ссылками по IP и домену. Логин admin, пароль появится в терминале.\n\n'
-while true; do
-  IFS= read -r -p "Введите домен прокси для tg://proxy ссылок (например proxy.example.ru): " PUBLIC_HOST </dev/tty \
-    || die "Не удалось прочитать домен"
-  PUBLIC_HOST="${PUBLIC_HOST,,}"
-  PUBLIC_HOST="${PUBLIC_HOST%.}"
-  if [[ "$PUBLIC_HOST" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]; then
-    break
-  fi
-  printf '\033[1;31mНекорректный домен. Укажите FQDN, например proxy.example.ru.\033[0m\n' >&2
-done
-
-# Все изменяемые настройки выполняются из панели после установки.
-# Значение используется только как безопасный стартовый SNI до изменения в UI.
-TLS_DOMAIN="vk.com"
-PANEL_PORT="8787"
-
-if [[ -f /etc/os-release ]]; then
-  # shellcheck disable=SC1091
-  . /etc/os-release
-  case "${ID:-}" in
-    debian|ubuntu) ;;
-    *) die "Базовый installer поддерживает Debian/Ubuntu; обнаружено: ${ID:-unknown}" ;;
-  esac
-else
-  die "Не найден /etc/os-release"
+if [[ "${EUID}" -ne 0 ]]; then
+  echo "Run as root: sudo bash $0"
+  exit 1
 fi
-command -v systemctl >/dev/null || die "Требуется systemd"
 
-clean_previous_installation
+apt-get update
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  ca-certificates curl gnupg openssl python3 python3-venv python3-pip sqlite3 jq ufw
 
-# Безопасная повторная установка: сохраняем работающие конфиги и убираем старые конфликтующие drop-in unit overrides.
-EXISTING_PANEL_SETTINGS=0
-[[ -s /etc/mtproxy-panel/settings.json ]] && EXISTING_PANEL_SETTINGS=1
-BACKUP_DIR="/var/backups/mtproxy-panel/$(date -u +%Y%m%dT%H%M%SZ)-v${APP_VERSION}"
-install -d -m 0700 "$BACKUP_DIR"
-for keep in /etc/telemt/telemt.toml /etc/mtproxy-panel/settings.json /etc/xray-cascade/client.json /etc/systemd/system/mtproxy-panel.service; do
-  if [[ -e "$keep" ]]; then
-    cp -a --parents "$keep" "$BACKUP_DIR/" || true
-  fi
-done
-rm -rf /etc/systemd/system/mtproxy-panel.service.d
+if ! command -v docker >/dev/null 2>&1; then
+  curl -fsSL https://get.docker.com | sh
+fi
 
-log "1/10" "Устанавливаю системные зависимости"
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq ca-certificates curl unzip python3 openssl >/dev/null
+if ! docker compose version >/dev/null 2>&1; then
+  apt-get install -y docker-compose-plugin
+fi
 
-case "$(uname -m)" in
-  x86_64|amd64)
-    TELEMT_ARCH="x86_64"
-    XRAY_ARCHIVE="Xray-linux-64.zip"
-    ;;
-  aarch64|arm64)
-    TELEMT_ARCH="aarch64"
-    XRAY_ARCHIVE="Xray-linux-arm64-v8a.zip"
-    ;;
-  *) die "Поддерживаются только x86_64 и aarch64" ;;
-esac
+id -u "${APP_USER}" >/dev/null 2>&1 || useradd --system --home "${APP_DIR}" --shell /usr/sbin/nologin "${APP_USER}"
+install -d -m 0750 -o "${APP_USER}" -g "${APP_USER}" "${APP_DIR}"
+install -d -m 0750 -o "${APP_USER}" -g "${APP_USER}" "${APP_DIR}/data"
+install -d -m 0750 -o "${APP_USER}" -g "${APP_USER}" "${APP_DIR}/runtime"
 
-WORKDIR="$(mktemp -d)"
-cleanup() { rm -rf "$WORKDIR"; }
-trap cleanup EXIT
+cat > "${APP_DIR}/app.py" <<'PYAPP'
+from __future__ import annotations
 
-log "2/10" "Устанавливаю telemt ${TELEMT_VERSION} (pinned)"
-curl -fsSL --retry 3 \
-  "https://github.com/telemt/telemt/releases/download/${TELEMT_VERSION}/telemt-${TELEMT_ARCH}-linux-gnu.tar.gz" \
-  -o "$WORKDIR/telemt.tar.gz"
-tar -xzf "$WORKDIR/telemt.tar.gz" -C "$WORKDIR"
-[[ -x "$WORKDIR/telemt" ]] || die "В архиве telemt не найден бинарник"
-install -m 0755 "$WORKDIR/telemt" /usr/local/bin/telemt
-
-log "3/10" "Устанавливаю Xray-core ${XRAY_VERSION} (pinned)"
-curl -fsSL --retry 3 \
-  "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/${XRAY_ARCHIVE}" \
-  -o "$WORKDIR/xray.zip"
-unzip -q -o "$WORKDIR/xray.zip" xray -d "$WORKDIR/xray"
-[[ -x "$WORKDIR/xray/xray" ]] || die "В архиве Xray не найден бинарник"
-install -m 0755 "$WORKDIR/xray/xray" /usr/local/bin/xray
-
-log "4/10" "Создаю системных пользователей и каталоги"
-id -u telemt >/dev/null 2>&1 || useradd --system --home-dir /var/lib/telemt --create-home --shell /usr/sbin/nologin telemt
-id -u xray-cascade >/dev/null 2>&1 || useradd --system --home-dir /var/lib/xray-cascade --create-home --shell /usr/sbin/nologin xray-cascade
-install -d -m 0750 -o telemt -g telemt /etc/telemt /var/lib/telemt /var/lib/telemt/tlsfront
-install -d -m 0750 -o root -g root /etc/mtproxy-panel /opt/mtproxy-panel
-install -d -m 0750 -o root -g xray-cascade /etc/xray-cascade /var/lib/xray-cascade
-
-[[ -n "$ADMIN_PASSWORD" ]] || ADMIN_PASSWORD="$(openssl rand -hex 12)"
-API_AUTH="Bearer $(openssl rand -hex 32)"
-BOOTSTRAP_SECRET="$(openssl rand -hex 16)"
-
-log "5/10" "Формирую fail-closed конфигурацию telemt"
-if [[ -s /etc/telemt/telemt.toml ]]; then
-  log "5/10" "Сохраняю существующих пользователей telemt и обновляю только публичный домен ссылок"
-  PANEL_PUBLIC_HOST="$PUBLIC_HOST" python3 - <<'PY'
+import json
+import os
+import secrets
+import sqlite3
+import subprocess
+import time
+import urllib.parse
 from pathlib import Path
-import os, re
-path = Path('/etc/telemt/telemt.toml')
-current = path.read_text(encoding='utf-8')
-updated, count = re.subn(
-    r'(?m)^public_host\s*=\s*"[^"]*"\s*$',
-    f'public_host = "{os.environ["PANEL_PUBLIC_HOST"]}"',
-    current,
-    count=1,
-)
-if count != 1:
-    raise SystemExit('В существующем telemt.toml не найден general.links.public_host')
-tmp = path.with_suffix('.tmp.install')
-tmp.write_text(updated, encoding='utf-8')
-tmp.chmod(0o640)
-tmp.replace(path)
-PY
-else
-cat > /etc/telemt/telemt.toml <<EOF
-# Managed by MTProxy Telemt + REALITY Cascade Panel v${APP_VERSION}
-# Route is fail-closed: only the local SOCKS5 cascade is configured.
+from typing import Any, Literal
+
+from fastapi import Depends, FastAPI, Form, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+
+APP_DIR = Path("/opt/telemt-cascade-panel")
+DATA_DIR = APP_DIR / "data"
+RUNTIME_DIR = APP_DIR / "runtime"
+DB_PATH = DATA_DIR / "panel.sqlite3"
+
+PUBLIC_IP = os.getenv("PUBLIC_IP", "127.0.0.1")
+PANEL_SECRET = os.getenv("PANEL_SECRET", "")
+TELEMT_IMAGE = os.getenv("TELEMT_IMAGE", "ghcr.io/telemt/telemt:3.4.14")
+SING_BOX_IMAGE = os.getenv("SING_BOX_IMAGE", "ghcr.io/sagernet/sing-box:latest")
+
+app = FastAPI(title="TeleMT Cascade Test Panel")
+security = HTTPBasic()
+
+
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+
+    with get_db() as conn:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS routes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK(kind IN ('vless','socks','http')),
+          raw_config TEXT NOT NULL,
+          is_active INTEGER NOT NULL DEFAULT 0,
+          last_status TEXT NOT NULL DEFAULT 'unknown',
+          last_error TEXT,
+          created_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS access_keys (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          secret TEXT NOT NULL UNIQUE,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          created_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS settings (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );
+        """)
+        if conn.execute("SELECT COUNT(*) AS c FROM access_keys").fetchone()["c"] == 0:
+            conn.execute(
+                "INSERT INTO access_keys(name, secret, enabled, created_at) VALUES(?,?,1,?)",
+                ("default", secrets.token_hex(16), int(time.time())),
+            )
+        conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('listen_port','443')")
+        conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('fake_tls_domain','vk.com')")
+        conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('public_host',?)", (PUBLIC_IP,))
+
+
+@app.on_event("startup")
+def startup() -> None:
+    init_db()
+
+
+def require_auth(credentials: HTTPBasicCredentials = Depends(security)) -> str:
+    if not (
+        secrets.compare_digest(credentials.username, "admin")
+        and secrets.compare_digest(credentials.password, PANEL_SECRET)
+    ):
+        raise HTTPException(status_code=401, headers={"WWW-Authenticate": "Basic"})
+    return credentials.username
+
+
+def run(cmd: list[str], timeout: int = 60) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, cwd=APP_DIR, text=True, capture_output=True, timeout=timeout)
+
+
+def setting(key: str, default: str = "") -> str:
+    with get_db() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+
+
+def safe_toml_key(name: str) -> str:
+    key = "".join(ch if ch.isalnum() or ch in "_-" else "_" for ch in name.strip()) or "user"
+    return f'"{key}"'
+
+
+def mtproto_link(secret: str) -> str:
+    host = setting("public_host", PUBLIC_IP)
+    port = setting("listen_port", "443")
+    return f"https://t.me/proxy?server={urllib.parse.quote(host)}&port={port}&secret={secret}"
+
+
+def parse_vless(uri: str) -> dict[str, Any]:
+    parsed = urllib.parse.urlparse(uri.strip())
+    if parsed.scheme != "vless":
+        raise ValueError("VLESS config must start with vless://")
+
+    uuid = parsed.username
+    server = parsed.hostname
+    port = parsed.port
+    if not uuid or not server or not port:
+        raise ValueError("VLESS URI must contain uuid, host and port")
+
+    q = urllib.parse.parse_qs(parsed.query)
+    flow = q.get("flow", [""])[0]
+    security = q.get("security", ["none"])[0]
+    sni = q.get("sni", q.get("serverName", [""]))[0]
+    fp = q.get("fp", ["chrome"])[0]
+    pbk = q.get("pbk", [""])[0]
+    sid = q.get("sid", [""])[0]
+    spx = q.get("spx", ["/"])[0]
+    network = q.get("type", ["tcp"])[0]
+    path = q.get("path", [""])[0]
+    host = q.get("host", [""])[0]
+
+    outbound: dict[str, Any] = {
+        "type": "vless",
+        "tag": "cascade",
+        "server": server,
+        "server_port": port,
+        "uuid": uuid,
+        "network": network,
+    }
+    if flow:
+        outbound["flow"] = flow
+
+    if security in {"tls", "reality"}:
+        outbound["tls"] = {
+            "enabled": True,
+            "server_name": sni or server,
+            "utls": {"enabled": True, "fingerprint": fp},
+        }
+        if security == "reality":
+            outbound["tls"]["reality"] = {
+                "enabled": True,
+                "public_key": pbk,
+                "short_id": sid,
+            }
+            if spx:
+                outbound["tls"]["reality"]["spider_x"] = spx
+
+    if network == "ws":
+        outbound["transport"] = {"type": "ws", "path": path or "/", "headers": {}}
+        if host:
+            outbound["transport"]["headers"]["Host"] = host
+
+    return outbound
+
+
+def parse_proxy(kind: Literal["socks", "http"], raw: str) -> dict[str, Any]:
+    data = json.loads(raw)
+    outbound: dict[str, Any] = {
+        "type": kind,
+        "tag": "cascade",
+        "server": data["server"].strip(),
+        "server_port": int(data["port"]),
+    }
+    if data.get("username"):
+        outbound["username"] = data["username"]
+    if data.get("password"):
+        outbound["password"] = data["password"]
+    return outbound
+
+
+def build_singbox_config(route: sqlite3.Row | None) -> dict[str, Any]:
+    if route is None:
+        outbound = {"type": "direct", "tag": "cascade"}
+    elif route["kind"] == "vless":
+        outbound = parse_vless(route["raw_config"])
+    elif route["kind"] in {"socks", "http"}:
+        outbound = parse_proxy(route["kind"], route["raw_config"])
+    else:
+        raise ValueError("Unknown route kind")
+
+    return {
+        "log": {"level": "info"},
+        "dns": {"servers": [{"tag": "google", "address": "8.8.8.8"}]},
+        "inbounds": [
+            {
+                "type": "tun",
+                "tag": "tun-in",
+                "interface_name": "tun0",
+                "inet4_address": "172.19.0.1/30",
+                "auto_route": True,
+                "strict_route": False,
+                "stack": "system",
+                "sniff": True,
+            }
+        ],
+        "outbounds": [
+            outbound,
+            {"type": "direct", "tag": "direct"},
+            {"type": "block", "tag": "block"},
+        ],
+        "route": {"auto_detect_interface": True, "final": "cascade"},
+    }
+
+
+def build_telemt_config() -> str:
+    with get_db() as conn:
+        rows = conn.execute("SELECT name, secret FROM access_keys WHERE enabled=1 ORDER BY id").fetchall()
+
+    users = "\n".join([f"{safe_toml_key(row['name'])} = \"{row['secret']}\"" for row in rows])
+    return f"""
 [general]
 use_middle_proxy = false
 log_level = "normal"
@@ -170,1126 +273,365 @@ tls = true
 
 [general.links]
 show = "*"
-public_host = "${PUBLIC_HOST}"
-public_port = 443
+public_host = "{setting("public_host", PUBLIC_IP)}"
+public_port = {int(setting("listen_port", "443"))}
 
 [server]
 port = 443
+max_connections = 10000
 
-[server.api]
+[server.tls]
 enabled = true
-listen = "127.0.0.1:9091"
-whitelist = ["127.0.0.1/32", "::1/128"]
-auth_header = "${API_AUTH}"
-minimal_runtime_enabled = true
-read_only = false
-
-[[server.listeners]]
-ip = "0.0.0.0"
-
-[censorship]
-tls_domain = "${TLS_DOMAIN}"
+domain = "{setting("fake_tls_domain", "vk.com")}"
 mask = true
-tls_emulation = true
-tls_front_dir = "/var/lib/telemt/tlsfront"
+mask_addr = "vk.com:443"
+
+[access]
+enabled = true
 
 [access.users]
-bootstrap = "${BOOTSTRAP_SECRET}"
-
-[[upstreams]]
-type = "socks5"
-address = "127.0.0.1:1080"
-weight = 1
-enabled = true
-EOF
-fi
-chown telemt:telemt /etc/telemt/telemt.toml
-chmod 0640 /etc/telemt/telemt.toml
-
-cat > /etc/systemd/system/telemt.service <<'EOF'
-[Unit]
-Description=telemt MTProto proxy (cascade-only)
-After=network-online.target xray-cascade.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=telemt
-Group=telemt
-WorkingDirectory=/var/lib/telemt
-ExecStart=/usr/local/bin/telemt /etc/telemt/telemt.toml
-Restart=on-failure
-RestartSec=3
-LimitNOFILE=65536
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectHome=true
-ProtectSystem=strict
-ReadWritePaths=/etc/telemt /var/lib/telemt
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-cat > /etc/systemd/system/xray-cascade.service <<'EOF'
-[Unit]
-Description=Xray VLESS REALITY cascade client for telemt
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=xray-cascade
-Group=xray-cascade
-WorkingDirectory=/var/lib/xray-cascade
-ExecStart=/usr/local/bin/xray run -config /etc/xray-cascade/client.json
-Restart=on-failure
-RestartSec=3
-LimitNOFILE=65536
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectHome=true
-ProtectSystem=strict
-ReadOnlyPaths=/etc/xray-cascade
-ReadWritePaths=/var/lib/xray-cascade
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-log "6/10" "Записываю или мигрирую конфигурацию панели"
-PANEL_ADMIN_PASSWORD="$ADMIN_PASSWORD" PANEL_API_AUTH="$API_AUTH" PANEL_PORT="$PANEL_PORT" \
-PANEL_PUBLIC_HOST="$PUBLIC_HOST" PANEL_TLS_DOMAIN="$TLS_DOMAIN" \
-PANEL_APP_VERSION="$APP_VERSION" PANEL_TELEMT_VERSION="$TELEMT_VERSION" PANEL_XRAY_VERSION="$XRAY_VERSION" \
-python3 - <<'PY'
-import base64, hashlib, json, os, re, secrets
-from pathlib import Path
-
-settings_path = Path('/etc/mtproxy-panel/settings.json')
-telemt_path = Path('/etc/telemt/telemt.toml')
-existing = {}
-if settings_path.exists():
-    try:
-        existing = json.loads(settings_path.read_text(encoding='utf-8'))
-    except Exception:
-        existing = {}
-
-telemt_text = telemt_path.read_text(encoding='utf-8') if telemt_path.exists() else ''
-auth_match = re.search(r'(?m)^auth_header\s*=\s*"([^"]+)"', telemt_text)
-tls_match = re.search(r'(?m)^tls_domain\s*=\s*"([^"]+)"', telemt_text)
-
-config = dict(existing)
-config.update({
-    'app_version': os.environ['PANEL_APP_VERSION'],
-    'telemt_version': os.environ['PANEL_TELEMT_VERSION'],
-    'xray_version': os.environ['PANEL_XRAY_VERSION'],
-    'listen': f"0.0.0.0:{os.environ['PANEL_PORT']}",
-    'public_host': os.environ['PANEL_PUBLIC_HOST'],
-    'telemt_api': 'http://127.0.0.1:9091',
-})
-config.setdefault('telemt_auth_header', auth_match.group(1) if auth_match else os.environ['PANEL_API_AUTH'])
-config.setdefault('tls_domain', tls_match.group(1) if tls_match else os.environ['PANEL_TLS_DOMAIN'])
-config.setdefault('cascade', None)
-config.setdefault('cascade_profiles', [])
-config.setdefault('active_cascade_profile', None)
-
-if 'password_salt' not in config or 'password_hash' not in config:
-    salt = secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac('sha256', os.environ['PANEL_ADMIN_PASSWORD'].encode(), salt, 350_000)
-    config['password_salt'] = base64.b64encode(salt).decode()
-    config['password_hash'] = base64.b64encode(digest).decode()
-config.setdefault('session_secret', secrets.token_urlsafe(48))
-
-tmp = settings_path.with_suffix('.tmp.install')
-tmp.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding='utf-8')
-tmp.chmod(0o600)
-tmp.replace(settings_path)
-PY
-chmod 0600 /etc/mtproxy-panel/settings.json
-
-log "7/10" "Устанавливаю минимальную localhost-панель"
-cat > /opt/mtproxy-panel/app.py <<'PYAPP'
-#!/usr/bin/env python3
-"""Minimal admin panel for telemt + local Xray REALITY cascade.
-The panel binds to a public testing port and is protected by administrator authentication.
-"""
-from __future__ import annotations
-
-import base64
-import hashlib
-import hmac
-import html
-import ipaddress
-import json
-import os
-import re
-import secrets
-import shutil
-import socket
-import subprocess
-import tempfile
-import threading
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
-from http import HTTPStatus
-from http.cookies import SimpleCookie
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-from typing import Any
-
-SETTINGS_PATH = Path('/etc/mtproxy-panel/settings.json')
-XRAY_CONFIG_PATH = Path('/etc/xray-cascade/client.json')
-XRAY_CONFIG_BACKUP = Path('/etc/xray-cascade/client.json.bak')
-SESSIONS: dict[str, dict[str, Any]] = {}
-SESSION_TTL = 12 * 60 * 60
-USERNAME_RE = re.compile(r'^[A-Za-z0-9_.-]{1,64}$')
-PROFILE_RE = re.compile(r'^[A-Za-z0-9_. -]{1,64}$')
-SID_RE = re.compile(r'^[0-9a-fA-F]{0,16}$')
-ALLOWED_FP = {'chrome', 'firefox', 'safari', 'ios', 'android', 'edge', '360', 'qq', 'random'}
-SYSTEMCTL_TIMEOUT = 4.0
-API_READ_TIMEOUT = 0.8
-API_WRITE_TIMEOUT = 3.0
-MAX_FORM_BYTES = 64 * 1024
-OPERATION_LOCK = threading.Lock()
-OPERATION_STATE: dict[str, Any] = {'running': False, 'label': '', 'message': '', 'error': '', 'updated_at': 0.0}
+{users}
+""".strip() + "\n"
 
 
-def operation_snapshot() -> dict[str, Any]:
-    with OPERATION_LOCK:
-        return dict(OPERATION_STATE)
+def write_runtime() -> None:
+    with get_db() as conn:
+        route = conn.execute("SELECT * FROM routes WHERE is_active=1 LIMIT 1").fetchone()
 
-
-def start_operation(label: str, action: Any, *args: Any) -> str:
-    with OPERATION_LOCK:
-        if OPERATION_STATE['running']:
-            raise ValueError(f"Уже выполняется операция: {OPERATION_STATE['label']}. Подождите несколько секунд и обновите страницу.")
-        OPERATION_STATE.update({'running': True, 'label': label, 'message': '', 'error': '', 'updated_at': time.time()})
-
-    def runner() -> None:
-        try:
-            result = action(*args)
-            with OPERATION_LOCK:
-                OPERATION_STATE.update({'running': False, 'message': result, 'error': '', 'updated_at': time.time()})
-        except Exception as exc:
-            with OPERATION_LOCK:
-                OPERATION_STATE.update({'running': False, 'message': '', 'error': str(exc), 'updated_at': time.time()})
-
-    threading.Thread(target=runner, name=f'panel-op-{label}', daemon=True).start()
-    return f'Операция «{label}» запущена в фоне. Статус обновится автоматически.'
-
-
-def load_settings() -> dict[str, Any]:
-    with SETTINGS_PATH.open('r', encoding='utf-8') as fh:
-        return json.load(fh)
-
-
-def save_settings(settings: dict[str, Any]) -> None:
-    tmp = SETTINGS_PATH.with_suffix('.tmp')
-    with tmp.open('w', encoding='utf-8') as fh:
-        json.dump(settings, fh, ensure_ascii=False, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, SETTINGS_PATH)
-
-
-def esc(value: Any) -> str:
-    return html.escape(str(value), quote=True)
-
-
-def systemctl(*args: str, timeout: float = SYSTEMCTL_TIMEOUT) -> subprocess.CompletedProcess[str]:
-    command = ['systemctl', *args]
-    try:
-        return subprocess.run(command, text=True, capture_output=True, timeout=timeout, check=False)
-    except subprocess.TimeoutExpired:
-        return subprocess.CompletedProcess(command, 124, '', f'systemctl timeout after {timeout:.1f}s')
-
-
-def is_active(service: str) -> bool:
-    return systemctl('is-active', '--quiet', service, timeout=1.0).returncode == 0
-
-
-def infer_cascade_summary() -> dict[str, str] | None:
-    if not XRAY_CONFIG_PATH.exists():
-        return None
-    try:
-        config = json.loads(XRAY_CONFIG_PATH.read_text(encoding='utf-8'))
-        outbound = next(item for item in config.get('outbounds', []) if item.get('tag') in {'vless-egress', 'reality-egress'})
-        stream = outbound.get('streamSettings', {})
-        security = stream.get('security', 'none')
-        network = stream.get('network', 'raw')
-        settings = outbound.get('settings', {})
-
-        address = settings.get('address')
-        port = settings.get('port')
-        flow = settings.get('flow', 'none')
-        if not address:
-            vnext = (settings.get('vnext') or [{}])[0]
-            address = vnext.get('address')
-            port = vnext.get('port')
-            users = vnext.get('users') or [{}]
-            flow = users[0].get('flow', 'none') if users else 'none'
-
-        sni = '-'
-        fingerprint = '-'
-        if security == 'reality':
-            reality = stream.get('realitySettings', {})
-            sni = reality.get('serverName', '-')
-            fingerprint = reality.get('fingerprint', '-')
-        elif security == 'tls':
-            tls = stream.get('tlsSettings', {})
-            sni = tls.get('serverName', '-')
-            fingerprint = tls.get('fingerprint', '-')
-
-        if not address or not port:
-            return None
-        return {
-            'endpoint': f'{address}:{port}',
-            'sni': sni,
-            'fingerprint': fingerprint,
-            'flow': flow or 'none',
-            'security': security,
-            'network': network,
-            'recovered': True,
-        }
-    except Exception:
-        return None
-
-
-def tcp_probe(host: str, port: int, timeout: float = 0.4) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except Exception:
-        return False
-
-
-def telemt_request(path: str, method: str = 'GET', payload: dict[str, Any] | None = None, timeout: float | None = None) -> tuple[int, dict[str, Any]]:
-    settings = load_settings()
-    body = None if payload is None else json.dumps(payload).encode('utf-8')
-    request_timeout = timeout if timeout is not None else (API_READ_TIMEOUT if method == 'GET' else API_WRITE_TIMEOUT)
-    request = urllib.request.Request(
-        settings['telemt_api'] + path,
-        data=body,
-        method=method,
-        headers={
-            'Authorization': settings['telemt_auth_header'],
-            'Content-Type': 'application/json',
-        },
+    (RUNTIME_DIR / "sing-box.json").write_text(
+        json.dumps(build_singbox_config(route), indent=2, ensure_ascii=False),
+        encoding="utf-8",
     )
+    (RUNTIME_DIR / "telemt.toml").write_text(build_telemt_config(), encoding="utf-8")
+
+    compose = f"""
+services:
+  egress:
+    image: {SING_BOX_IMAGE}
+    container_name: telemt-cascade-egress
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - {RUNTIME_DIR}/sing-box.json:/etc/sing-box/config.json:ro
+    command: ["run", "-c", "/etc/sing-box/config.json"]
+    ports:
+      - "{int(setting("listen_port", "443"))}:443/tcp"
+
+  telemt:
+    image: {TELEMT_IMAGE}
+    container_name: telemt-cascade
+    restart: unless-stopped
+    network_mode: "service:egress"
+    depends_on:
+      - egress
+    working_dir: /run/telemt
+    tmpfs:
+      - /run/telemt:rw,mode=1777,size=4m
+    volumes:
+      - {RUNTIME_DIR}/telemt.toml:/etc/telemt/config.toml:ro
+    environment:
+      - RUST_LOG=info
+    command: ["/etc/telemt/config.toml"]
+""".strip() + "\n"
+    (APP_DIR / "docker-compose.yml").write_text(compose, encoding="utf-8")
+
+
+def docker_up() -> tuple[bool, str]:
+    write_runtime()
+    r = run(["docker", "compose", "up", "-d"], timeout=180)
+    return r.returncode == 0, (r.stdout + r.stderr)[-5000:]
+
+
+def docker_down() -> tuple[bool, str]:
+    r = run(["docker", "compose", "down"], timeout=120)
+    return r.returncode == 0, (r.stdout + r.stderr)[-5000:]
+
+
+def check_runtime() -> tuple[bool, str]:
+    ps = run(["docker", "ps", "--filter", "name=telemt-cascade", "--format", "{{.Names}} {{.Status}}"], timeout=20)
+    if "telemt-cascade-egress" not in ps.stdout:
+        return False, "egress container is not running"
+    if "telemt-cascade" not in ps.stdout:
+        return False, "telemt container is not running"
+
+    logs = run(["docker", "logs", "--tail", "160", "telemt-cascade"], timeout=20)
+    text = (logs.stdout + logs.stderr).lower()
+    if "panic" in text:
+        return False, (logs.stdout + logs.stderr)[-1500:]
+    return True, "containers are running; verify final MTProto link inside Telegram client"
+
+
+def html_page(body: str) -> HTMLResponse:
+    return HTMLResponse(f"""
+<!doctype html><html lang="ru"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>TeleMT Cascade Panel</title>
+<style>
+body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0b1020;color:#e7eaf3;margin:0}}
+main{{max-width:1100px;margin:32px auto;padding:0 18px}}
+.card{{background:#121a33;border:1px solid #263153;border-radius:16px;padding:18px;margin:16px 0;box-shadow:0 10px 30px #0004}}
+input,textarea,select{{width:100%;box-sizing:border-box;background:#0b1020;color:#e7eaf3;border:1px solid #33406a;border-radius:10px;padding:10px;margin:6px 0 12px}}
+textarea{{min-height:110px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}}
+button{{background:#5d7cff;color:white;border:0;border-radius:10px;padding:10px 14px;cursor:pointer;margin:2px}}
+.badge{{display:inline-block;padding:4px 8px;border-radius:999px;background:#263153;margin-right:6px}}
+.ok{{background:#14532d}} .bad{{background:#7f1d1d}} .muted{{color:#9ba6c7}}
+table{{width:100%;border-collapse:collapse}} td,th{{border-bottom:1px solid #263153;padding:8px;text-align:left;vertical-align:top}}
+code{{word-break:break-all}}
+</style></head><body><main>
+<h1>TeleMT Cascade Test Panel</h1>
+{body}
+</main></body></html>
+""")
+
+
+@app.get("/", response_class=HTMLResponse)
+def index(_: str = Depends(require_auth)) -> HTMLResponse:
+    with get_db() as conn:
+        routes = conn.execute("SELECT * FROM routes ORDER BY id DESC").fetchall()
+        keys = conn.execute("SELECT * FROM access_keys ORDER BY id DESC").fetchall()
+
+    active = next((r for r in routes if r["is_active"]), None)
+    ps = run(["docker", "ps", "--filter", "name=telemt-cascade", "--format", "{{.Names}} {{.Status}}"], timeout=20)
+    running = "telemt-cascade" in ps.stdout
+
+    routes_rows = "".join(
+        f"<tr><td>{r['id']}</td><td>{r['name']}</td><td>{r['kind']}</td>"
+        f"<td>{'<span class=badge>active</span>' if r['is_active'] else ''}{r['last_status']}</td>"
+        f"<td><form method=post action=/routes/{r['id']}/activate><button>Активировать</button></form></td></tr>"
+        for r in routes
+    ) or "<tr><td colspan=5 class=muted>Маршрутов пока нет</td></tr>"
+
+    key_rows = "".join(
+        f"<tr><td>{k['name']}</td><td><code>{mtproto_link(k['secret'])}</code></td><td>{'enabled' if k['enabled'] else 'disabled'}</td></tr>"
+        for k in keys
+    )
+
+    body = f"""
+<div class="card">
+  <div class="badge {'ok' if running else 'bad'}">TeleMT: {'running' if running else 'stopped'}</div>
+  <div class="badge {'ok' if active else 'bad'}">Cascade: {active['name'] if active else 'direct / not configured'}</div>
+  <p class="muted">Public: <code>{setting('public_host', PUBLIC_IP)}:{setting('listen_port','443')}</code>, Fake TLS SNI: <code>{setting('fake_tls_domain','vk.com')}</code></p>
+  <form method="post" action="/start" style="display:inline"><button>Старт / применить</button></form>
+  <form method="post" action="/stop" style="display:inline"><button>Стоп</button></form>
+  <form method="post" action="/check" style="display:inline"><button>Проверить</button></form>
+</div>
+
+<div class="card">
+<h2>Настройки входа</h2>
+<form method="post" action="/settings">
+<label>Public host/IP для ссылки</label><input name="public_host" value="{setting('public_host', PUBLIC_IP)}"/>
+<label>Внешний порт TeleMT</label><input name="listen_port" value="{setting('listen_port','443')}"/>
+<label>Fake TLS domain / SNI</label><input name="fake_tls_domain" value="{setting('fake_tls_domain','vk.com')}"/>
+<button>Сохранить</button>
+</form>
+</div>
+
+<div class="card">
+<h2>Добавить VLESS route</h2>
+<form method="post" action="/routes/vless">
+<label>Название</label><input name="name" placeholder="EU VLESS #1"/>
+<label>VLESS URI</label><textarea name="vless_uri" placeholder="vless://uuid@host:443?security=reality&..."></textarea>
+<button>Добавить</button>
+</form>
+</div>
+
+<div class="card">
+<h2>Добавить HTTP/SOCKS proxy route</h2>
+<form method="post" action="/routes/proxy">
+<label>Название</label><input name="name" placeholder="Backup SOCKS"/>
+<label>Тип</label><select name="kind"><option value="socks">SOCKS5</option><option value="http">HTTP</option></select>
+<label>IP / host</label><input name="server"/>
+<label>Порт</label><input name="port"/>
+<label>Логин</label><input name="username"/>
+<label>Пароль</label><input name="password" type="password"/>
+<button>Добавить</button>
+</form>
+</div>
+
+<div class="card">
+<h2>Маршруты</h2>
+<table><tr><th>ID</th><th>Название</th><th>Тип</th><th>Статус</th><th></th></tr>{routes_rows}</table>
+</div>
+
+<div class="card">
+<h2>MTProto доступы</h2>
+<form method="post" action="/keys">
+<label>Название ключа</label><input name="name" placeholder="client-1"/>
+<button>Создать ключ</button>
+</form>
+<table><tr><th>Название</th><th>Ссылка</th><th>Статус</th></tr>{key_rows}</table>
+</div>
+"""
+    return html_page(body)
+
+
+@app.post("/settings")
+def save_settings(public_host: str = Form(...), listen_port: int = Form(...), fake_tls_domain: str = Form(...), _: str = Depends(require_auth)):
+    if listen_port < 1 or listen_port > 65535:
+        raise HTTPException(400, "Bad port")
+    set_setting("public_host", public_host.strip())
+    set_setting("listen_port", str(listen_port))
+    set_setting("fake_tls_domain", fake_tls_domain.strip() or "vk.com")
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/routes/vless")
+def add_vless(name: str = Form(...), vless_uri: str = Form(...), _: str = Depends(require_auth)):
     try:
-        with urllib.request.urlopen(request, timeout=request_timeout) as response:
-            return response.status, json.loads(response.read().decode('utf-8'))
-    except urllib.error.HTTPError as exc:
-        try:
-            data = json.loads(exc.read().decode('utf-8'))
-        except Exception:
-            data = {'error': {'message': str(exc)}}
-        return exc.code, data
-    except Exception as exc:
-        return 0, {'error': {'message': str(exc)}}
+        parse_vless(vless_uri)
+    except Exception as e:
+        raise HTTPException(400, str(e))
+    with get_db() as conn:
+        conn.execute("INSERT INTO routes(name, kind, raw_config, created_at) VALUES(?,?,?,?)", (name.strip() or "VLESS", "vless", vless_uri.strip(), int(time.time())))
+    return RedirectResponse("/", status_code=303)
 
 
-def value_bool(value: str | None) -> bool:
-    return str(value or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+@app.post("/routes/proxy")
+def add_proxy_route(
+    name: str = Form(...),
+    kind: Literal["socks", "http"] = Form(...),
+    server: str = Form(...),
+    port: int = Form(...),
+    username: str = Form(""),
+    password: str = Form(""),
+    _: str = Depends(require_auth),
+):
+    raw = json.dumps({"server": server.strip(), "port": port, "username": username.strip(), "password": password})
+    parse_proxy(kind, raw)
+    with get_db() as conn:
+        conn.execute("INSERT INTO routes(name, kind, raw_config, created_at) VALUES(?,?,?,?)", (name.strip() or kind.upper(), kind, raw, int(time.time())))
+    return RedirectResponse("/", status_code=303)
 
 
-def split_csv(value: str | None) -> list[str]:
-    return [item.strip() for item in str(value or '').split(',') if item.strip()]
+@app.post("/routes/{route_id}/activate")
+def activate_route(route_id: int, _: str = Depends(require_auth)):
+    with get_db() as conn:
+        if not conn.execute("SELECT id FROM routes WHERE id=?", (route_id,)).fetchone():
+            raise HTTPException(404, "Route not found")
+        conn.execute("UPDATE routes SET is_active=0")
+        conn.execute("UPDATE routes SET is_active=1 WHERE id=?", (route_id,))
+    return RedirectResponse("/", status_code=303)
 
 
-def parse_vless_reality_uri(uri: str) -> tuple[dict[str, Any], dict[str, str]]:
-    """Parse common VLESS share links into an Xray outbound.
+@app.post("/keys")
+def create_key(name: str = Form(...), _: str = Depends(require_auth)):
+    with get_db() as conn:
+        conn.execute("INSERT INTO access_keys(name, secret, enabled, created_at) VALUES(?,?,1,?)", (name.strip() or "client", secrets.token_hex(16), int(time.time())))
+    return RedirectResponse("/", status_code=303)
 
-    Supported VLESS variants:
-    - security=reality / tls / none
-    - type=tcp/raw/ws/grpc/httpupgrade/xhttp/http/h2
-    - common query keys produced by v2rayN, Hiddify, Nekoray, sing-box converters.
-    """
-    parsed = urllib.parse.urlparse(uri.strip())
-    if parsed.scheme.lower() != 'vless':
-        raise ValueError('Нужна ссылка, начинающаяся с vless://')
-    if not parsed.username or not parsed.hostname or not parsed.port:
-        raise ValueError('В VLESS-ссылке отсутствуют UUID, адрес или порт')
-    try:
-        ipaddress.ip_address(parsed.hostname)
-    except ValueError:
-        if not re.fullmatch(r'[A-Za-z0-9.-]+', parsed.hostname):
-            raise ValueError('Некорректный адрес egress-сервера')
 
-    query = {key: values[-1] for key, values in urllib.parse.parse_qs(parsed.query, keep_blank_values=True).items()}
-    security = (query.get('security') or query.get('tls') or 'none').lower()
-    if security in {'', 'false', '0'}:
-        security = 'none'
-    if security not in {'none', 'tls', 'reality'}:
-        raise ValueError(f'VLESS security={security} пока не поддерживается. Поддерживаются: reality, tls, none.')
+@app.post("/start")
+def start(_: str = Depends(require_auth)):
+    ok, out = docker_up()
+    if not ok:
+        return PlainTextResponse(out, status_code=500)
+    return RedirectResponse("/", status_code=303)
 
-    network = (query.get('type') or query.get('network') or 'tcp').lower()
-    if network in {'tcp', 'raw'}:
-        network = 'raw'
-    elif network == 'h2':
-        network = 'http'
-    supported_networks = {'raw', 'ws', 'grpc', 'httpupgrade', 'xhttp', 'http'}
-    if network not in supported_networks:
-        raise ValueError(f'VLESS type={network} пока не поддерживается. Поддерживаются: tcp/raw/ws/grpc/httpupgrade/xhttp/http/h2.')
 
-    sni = query.get('sni') or query.get('serverName') or query.get('servername') or query.get('peer') or ''
-    host_header = query.get('host') or query.get('Host') or ''
-    public_key = query.get('pbk') or query.get('publicKey') or query.get('password') or ''
-    short_id = query.get('sid') or query.get('shortId') or ''
-    fingerprint = (query.get('fp') or query.get('fingerprint') or 'chrome').lower()
-    flow = query.get('flow') or ''
-    spider_x = query.get('spx') or query.get('spiderX') or '/'
-    path = query.get('path') or '/'
-    alpn = split_csv(query.get('alpn'))
+@app.post("/stop")
+def stop(_: str = Depends(require_auth)):
+    docker_down()
+    return RedirectResponse("/", status_code=303)
 
-    if security == 'reality':
-        # Do not hard-reject partial REALITY links in the UI. Different panels/exporters
-        # use different field names, and some links are intentionally minimal.
-        # Xray's config test remains the source of truth for whether the link is usable.
-        if not SID_RE.fullmatch(short_id) or len(short_id) % 2:
-            raise ValueError('sid/shortId должен быть hex-строкой чётной длины до 16 символов')
-        if not sni:
-            sni = host_header or parsed.hostname
-    if security == 'tls' and not sni:
-        sni = host_header or parsed.hostname
 
-    if fingerprint and fingerprint not in ALLOWED_FP:
-        if security == 'reality':
-            raise ValueError('Неподдерживаемый fp; используйте браузерный fingerprint, например chrome')
-        fingerprint = 'chrome'
+@app.post("/check")
+def check(_: str = Depends(require_auth)):
+    ok, msg = check_runtime()
+    with get_db() as conn:
+        conn.execute("UPDATE routes SET last_status=?, last_error=? WHERE is_active=1", ("ok" if ok else "error", None if ok else msg))
+    return PlainTextResponse(("OK: " if ok else "ERROR: ") + msg)
 
-    user = {
-        'id': urllib.parse.unquote(parsed.username),
-        'encryption': query.get('encryption') or 'none',
+
+@app.get("/api/status")
+def api_status(_: str = Depends(require_auth)):
+    with get_db() as conn:
+        active = conn.execute("SELECT id,name,kind,last_status,last_error FROM routes WHERE is_active=1").fetchone()
+        keys = conn.execute("SELECT name,secret,enabled FROM access_keys ORDER BY id").fetchall()
+
+    ps = run(["docker", "ps", "--filter", "name=telemt-cascade", "--format", "{{.Names}} {{.Status}}"], timeout=20)
+    return {
+        "public_host": setting("public_host", PUBLIC_IP),
+        "listen_port": int(setting("listen_port", "443")),
+        "fake_tls_domain": setting("fake_tls_domain", "vk.com"),
+        "running": "telemt-cascade" in ps.stdout,
+        "active_route": dict(active) if active else None,
+        "links": [{"name": k["name"], "enabled": bool(k["enabled"]), "link": mtproto_link(k["secret"])} for k in keys],
     }
-    if flow:
-        user['flow'] = flow
 
-    stream_settings: dict[str, Any] = {'network': network}
-    if security != 'none':
-        stream_settings['security'] = security
 
-    if security == 'reality':
-        reality_settings: dict[str, Any] = {
-            'serverName': sni,
-            'fingerprint': fingerprint,
-            'spiderX': spider_x,
-        }
-        if public_key:
-            reality_settings['password'] = public_key
-        if short_id:
-            reality_settings['shortId'] = short_id
-        stream_settings['realitySettings'] = reality_settings
-    elif security == 'tls':
-        tls_settings: dict[str, Any] = {
-            'serverName': sni,
-            'allowInsecure': value_bool(query.get('allowInsecure') or query.get('allowinsecure')),
-        }
-        if fingerprint:
-            tls_settings['fingerprint'] = fingerprint
-        if alpn:
-            tls_settings['alpn'] = alpn
-        stream_settings['tlsSettings'] = tls_settings
-
-    if network == 'ws':
-        ws_settings: dict[str, Any] = {'path': path}
-        if host_header:
-            ws_settings['headers'] = {'Host': host_header}
-        stream_settings['wsSettings'] = ws_settings
-    elif network == 'grpc':
-        stream_settings['grpcSettings'] = {
-            'serviceName': query.get('serviceName') or query.get('service_name') or '',
-            'multiMode': (query.get('mode') or '').lower() == 'multi' or value_bool(query.get('multiMode')),
-        }
-    elif network == 'httpupgrade':
-        settings: dict[str, Any] = {'path': path}
-        if host_header:
-            settings['host'] = host_header
-        stream_settings['httpupgradeSettings'] = settings
-    elif network == 'xhttp':
-        settings: dict[str, Any] = {'path': path, 'mode': query.get('mode') or 'auto'}
-        if host_header:
-            settings['host'] = host_header
-        stream_settings['xhttpSettings'] = settings
-    elif network == 'http':
-        settings: dict[str, Any] = {'path': path}
-        if host_header:
-            settings['host'] = [host_header]
-        stream_settings['httpSettings'] = settings
-
-    config = {
-        'log': {'loglevel': 'warning'},
-        'inbounds': [{
-            'tag': 'telemt-socks',
-            'listen': '127.0.0.1',
-            'port': 1080,
-            'protocol': 'socks',
-            'settings': {'auth': 'noauth', 'udp': False},
-        }],
-        'outbounds': [{
-            'tag': 'vless-egress',
-            'protocol': 'vless',
-            'settings': {'vnext': [{
-                'address': parsed.hostname,
-                'port': parsed.port,
-                'users': [user],
-            }]},
-            'streamSettings': stream_settings,
-        }],
-        'routing': {
-            'domainStrategy': 'AsIs',
-            'rules': [{'inboundTag': ['telemt-socks'], 'outboundTag': 'vless-egress'}],
-        },
+@app.get("/api/runtime")
+def api_runtime(_: str = Depends(require_auth)):
+    write_runtime()
+    return {
+        "compose": (APP_DIR / "docker-compose.yml").read_text(),
+        "sing_box": json.loads((RUNTIME_DIR / "sing-box.json").read_text()),
+        "telemt": (RUNTIME_DIR / "telemt.toml").read_text(),
     }
-    summary = {
-        'endpoint': f'{parsed.hostname}:{parsed.port}',
-        'sni': sni or '-',
-        'fingerprint': fingerprint or '-',
-        'flow': flow or 'none',
-        'security': security,
-        'network': network,
-    }
-    return config, summary
-
-
-
-def sanitize_profile_name(value: str, summary: dict[str, str]) -> str:
-    name = value.strip()
-    if not name:
-        name = f"{summary.get('endpoint', 'vless')} {summary.get('security', '-')}/{summary.get('network', '-')}"[:64]
-    if not PROFILE_RE.fullmatch(name):
-        raise ValueError('Имя профиля: 1–64 символа A-Z, a-z, 0-9, пробел, _, . или -')
-    return name
-
-
-def upsert_cascade_profile(settings: dict[str, Any], name: str, summary: dict[str, str], vless_uri: str) -> None:
-    profiles = settings.get('cascade_profiles')
-    if not isinstance(profiles, list):
-        profiles = []
-    entry = {
-        'name': name,
-        'summary': summary,
-        'vless_uri': vless_uri.strip(),
-        'updated_at': int(time.time()),
-    }
-    for index, profile in enumerate(profiles):
-        if isinstance(profile, dict) and profile.get('name') == name:
-            profiles[index] = entry
-            break
-    else:
-        profiles.append(entry)
-    settings['cascade_profiles'] = profiles[-30:]
-    settings['active_cascade_profile'] = name
-    settings['cascade'] = summary
-
-
-def find_cascade_profile(settings: dict[str, Any], name: str) -> dict[str, Any]:
-    name = name.strip()
-    for profile in settings.get('cascade_profiles') or []:
-        if isinstance(profile, dict) and profile.get('name') == name:
-            return profile
-    raise ValueError(f'VLESS-профиль не найден: {name}')
-
-
-def switch_cascade_profile(name: str) -> str:
-    settings = load_settings()
-    profile = find_cascade_profile(settings, name)
-    uri = str(profile.get('vless_uri') or '')
-    if not uri:
-        raise ValueError(f'В профиле {name} нет сохранённого VLESS URI')
-    return apply_cascade(uri, name)
-
-
-def delete_cascade_profile(name: str) -> str:
-    name = name.strip()
-    settings = load_settings()
-    old_profiles = settings.get('cascade_profiles') or []
-    profiles = [p for p in old_profiles if not (isinstance(p, dict) and p.get('name') == name)]
-    if len(profiles) == len(old_profiles):
-        raise ValueError(f'VLESS-профиль не найден: {name}')
-    was_active = settings.get('active_cascade_profile') == name
-    settings['cascade_profiles'] = profiles
-    if was_active:
-        settings['active_cascade_profile'] = None
-        settings['cascade'] = None
-        save_settings(settings)
-        disable_cascade()
-        return f'Активный VLESS-профиль {name} удалён, каскад остановлен fail-closed.'
-    save_settings(settings)
-    return f'VLESS-профиль {name} удалён.'
-
-
-def apply_cascade(vless_uri: str, profile_name: str = '') -> str:
-    config, summary = parse_vless_reality_uri(vless_uri)
-    profile_name = sanitize_profile_name(profile_name, summary)
-    XRAY_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix='client.', suffix='.json', dir=str(XRAY_CONFIG_PATH.parent))
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
-            json.dump(config, fh, ensure_ascii=False, indent=2)
-        os.chmod(tmp_name, 0o640)
-        subprocess.run(['chown', 'root:xray-cascade', tmp_name], check=True, timeout=5)
-        test = subprocess.run(['/usr/local/bin/xray', 'run', '-test', '-config', tmp_name], text=True, capture_output=True, timeout=10)
-        if test.returncode != 0:
-            raise ValueError('Xray отклонил конфигурацию: ' + (test.stderr.strip() or test.stdout.strip())[-500:])
-        if XRAY_CONFIG_PATH.exists():
-            shutil.copy2(XRAY_CONFIG_PATH, XRAY_CONFIG_BACKUP)
-        os.replace(tmp_name, XRAY_CONFIG_PATH)
-
-        xray_result = systemctl('restart', 'xray-cascade.service')
-        if xray_result.returncode != 0:
-            raise RuntimeError('Не удалось запустить Xray: ' + xray_result.stderr[-400:])
-        telemt_result = systemctl('restart', 'telemt.service')
-        if telemt_result.returncode != 0:
-            raise RuntimeError('Не удалось запустить telemt: ' + telemt_result.stderr[-400:])
-
-        settings = load_settings()
-        upsert_cascade_profile(settings, profile_name, summary, vless_uri)
-        save_settings(settings)
-        return f"VLESS-профиль «{profile_name}» применён: {summary['endpoint']} / {summary['security']} / {summary['network']} / SNI {summary['sni']}. Проверка readiness может занять до минуты."
-    except Exception:
-        try:
-            os.unlink(tmp_name)
-        except FileNotFoundError:
-            pass
-        if XRAY_CONFIG_BACKUP.exists():
-            shutil.copy2(XRAY_CONFIG_BACKUP, XRAY_CONFIG_PATH)
-            systemctl('restart', 'xray-cascade.service')
-        raise
-
-
-def disable_cascade() -> str:
-    systemctl('stop', 'telemt.service')
-    systemctl('stop', 'xray-cascade.service')
-    if XRAY_CONFIG_PATH.exists():
-        disabled_path = XRAY_CONFIG_PATH.with_suffix('.json.disabled')
-        if disabled_path.exists():
-            disabled_path.unlink()
-        XRAY_CONFIG_PATH.replace(disabled_path)
-    settings = load_settings()
-    settings['cascade'] = None
-    settings['active_cascade_profile'] = None
-    save_settings(settings)
-    return 'Каскад выключен. telemt остановлен fail-closed: сохранённые VLESS-профили остались в списке.'
-
-
-TLS_DOMAIN_RE = re.compile(r'^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$')
-
-
-def apply_tls_domain(value: str) -> str:
-    domain = value.strip().lower().rstrip('.')
-    if not TLS_DOMAIN_RE.fullmatch(domain):
-        raise ValueError('Некорректный SNI-домен. Пример: vk.com')
-    config_path = Path('/etc/telemt/telemt.toml')
-    current = config_path.read_text(encoding='utf-8')
-    updated, count = re.subn(r'(?m)^tls_domain\s*=\s*"[^"]*"\s*$', f'tls_domain = "{domain}"', current, count=1)
-    if count != 1:
-        raise RuntimeError('Не найден параметр tls_domain в telemt.toml')
-    tmp = config_path.with_suffix('.tmp')
-    tmp.write_text(updated, encoding='utf-8')
-    os.chmod(tmp, 0o640)
-    shutil.chown(tmp, user='telemt', group='telemt')
-    os.replace(tmp, config_path)
-    settings = load_settings()
-    settings['tls_domain'] = domain
-    save_settings(settings)
-    if is_active('telemt.service'):
-        result = systemctl('restart', 'telemt.service')
-        if result.returncode != 0:
-            raise RuntimeError('SNI сохранён, но telemt не перезапустился: ' + result.stderr[-400:])
-    return f'Fake TLS SNI сохранён: {domain}. Новые tg://proxy ссылки будут строиться с этим доменом.'
-
-
-def apply_admin_password(current: str, new_password: str, confirmation: str) -> str:
-    if not check_password(current):
-        raise ValueError('Текущий пароль указан неверно')
-    if len(new_password) < 12:
-        raise ValueError('Новый пароль должен содержать не менее 12 символов')
-    if new_password != confirmation:
-        raise ValueError('Подтверждение нового пароля не совпадает')
-    if '\n' in new_password or '\r' in new_password:
-        raise ValueError('Пароль не должен содержать переносы строк')
-    settings = load_settings()
-    salt = secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac('sha256', new_password.encode(), salt, 350_000)
-    settings['password_salt'] = base64.b64encode(salt).decode()
-    settings['password_hash'] = base64.b64encode(digest).decode()
-    save_settings(settings)
-    return 'Пароль администратора успешно изменён.'
-
-
-def check_password(password: str) -> bool:
-    settings = load_settings()
-    salt = base64.b64decode(settings['password_salt'])
-    expected = base64.b64decode(settings['password_hash'])
-    actual = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 350_000)
-    return hmac.compare_digest(actual, expected)
-
-
-def create_session() -> tuple[str, str]:
-    token = secrets.token_urlsafe(32)
-    csrf = secrets.token_urlsafe(24)
-    SESSIONS[token] = {'expires': time.time() + SESSION_TTL, 'csrf': csrf}
-    return token, csrf
-
-
-def session_from_cookie(cookie_header: str | None) -> tuple[str | None, dict[str, Any] | None]:
-    if not cookie_header:
-        return None, None
-    cookie = SimpleCookie(); cookie.load(cookie_header)
-    value = cookie.get('panel_session')
-    token = value.value if value else None
-    session = SESSIONS.get(token or '')
-    if not session or session['expires'] < time.time():
-        if token:
-            SESSIONS.pop(token, None)
-        return None, None
-    session['expires'] = time.time() + SESSION_TTL
-    return token, session
-
-
-def render_layout(content: str, title: str = 'MTProxy Panel') -> bytes:
-    style = '''
-    :root{color-scheme:dark;--bg:#0c1220;--card:#131d31;--line:#283650;--text:#eaf1ff;--muted:#97a8c7;--ok:#30d685;--bad:#ff6172;--blue:#5ba7ff}
-    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px system-ui,-apple-system,Segoe UI,sans-serif}
-    main{max-width:1100px;margin:32px auto;padding:0 18px}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}
-    h1{font-size:25px;margin:0}h2{font-size:18px;margin:0 0 13px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(325px,1fr));gap:16px}
-    .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:17px;margin-bottom:16px}.muted{color:var(--muted)}
-    .ok{color:var(--ok);font-weight:650}.bad{color:var(--bad);font-weight:650}.pill{border:1px solid var(--line);border-radius:999px;padding:5px 10px;display:inline-block;margin-right:6px}
-    input,textarea{width:100%;background:#09111f;color:var(--text);border:1px solid var(--line);padding:10px 11px;border-radius:9px;margin:6px 0 12px;font:inherit}
-    textarea{min-height:92px;resize:vertical}button{background:var(--blue);color:#07101e;border:0;border-radius:9px;padding:10px 14px;font-weight:700;cursor:pointer}
-    button.danger{background:#ff6172}button.secondary{background:#25334e;color:var(--text)}form.inline{display:inline}.flash{padding:12px;border-radius:10px;background:#102743;border:1px solid #284872;margin-bottom:16px}
-    .error{background:#381923;border-color:#65303b}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.user{padding:12px 0;border-top:1px solid var(--line)}
-    code{background:#07101e;padding:3px 5px;border-radius:5px;word-break:break-all}a{color:#8bc2ff}label{font-size:13px;color:var(--muted)}
-    .copyline{display:flex;gap:8px;align-items:center;margin:8px 0}.copyline input{margin:0;font-size:13px}.hint{font-size:13px;line-height:1.45}.warn{color:#ffd27a;font-weight:650}
-    '''
-    script = '''
-    <script>
-    async function copyById(id) {
-      const el = document.getElementById(id);
-      if (!el) return;
-      try {
-        await navigator.clipboard.writeText(el.value || el.textContent || '');
-      } catch (e) {
-        el.focus();
-        el.select && el.select();
-        document.execCommand('copy');
-      }
-    }
-    </script>
-    '''
-    return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)}</title><style>{style}</style>{script}</head><body><main>{content}</main></body></html>'''.encode('utf-8')
-
-
-def domain_hex(domain: str) -> str:
-    return domain.encode('utf-8').hex()
-
-
-def normalize_proxy_secret(raw: Any, tls_domain: str) -> str | None:
-    value = str(raw or '').strip()
-    if not value:
-        return None
-    if value.startswith(('tg://proxy?', 'https://t.me/proxy?', 'http://t.me/proxy?')):
-        return value
-    value = value.strip('"').strip("'")
-    clean = re.sub(r'\s+', '', value)
-    if clean.startswith('ee'):
-        return clean
-    if re.fullmatch(r'[0-9a-fA-F]+', clean):
-        suffix = domain_hex(tls_domain)
-        if clean.lower().endswith(suffix.lower()):
-            return 'ee' + clean
-        if len(clean) >= 32:
-            return 'ee' + clean + suffix
-    return value
-
-
-def proxy_url_from_secret(secret_or_url: str, public_host: str) -> str:
-    if secret_or_url.startswith(('tg://proxy?', 'https://t.me/proxy?', 'http://t.me/proxy?')):
-        return secret_or_url
-    return 'tg://proxy?' + urllib.parse.urlencode({
-        'server': public_host,
-        'port': '443',
-        'secret': secret_or_url,
-    })
-
-
-def collect_proxy_links(user: dict[str, Any], settings: dict[str, Any]) -> list[str]:
-    candidates: list[Any] = []
-
-    def collect(value: Any) -> None:
-        if not value:
-            return
-        if isinstance(value, str):
-            candidates.append(value)
-        elif isinstance(value, dict):
-            for key in ('url', 'link', 'proxy', 'tg', 'tls', 'ee_tls', 'secret', 'value'):
-                if key in value:
-                    collect(value[key])
-        elif isinstance(value, list):
-            for item in value:
-                collect(item)
-
-    links = user.get('links') or {}
-    collect(links.get('tls'))
-    collect(links.get('ee_tls'))
-    collect(links.get('proxy'))
-    collect(links)
-    for key in ('tls_secret', 'ee_secret', 'secret', 'secret_hex'):
-        if key in user:
-            collect(user[key])
-
-    result: list[str] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        secret = normalize_proxy_secret(candidate, settings.get('tls_domain', 'max.ru'))
-        if not secret:
-            continue
-        url = proxy_url_from_secret(secret, settings.get('public_host', ''))
-        if url not in seen:
-            result.append(url)
-            seen.add(url)
-    return result
-
-
-
-class Handler(BaseHTTPRequestHandler):
-    server_version = 'MTProxyPanel/1.4.1'
-
-    def setup(self) -> None:
-        super().setup()
-        self.connection.settimeout(10)
-
-    def log_message(self, fmt: str, *args: Any) -> None:
-        print(f'panel {self.address_string()} - {fmt % args}')
-
-    def read_form(self) -> dict[str, str]:
-        length = int(self.headers.get('Content-Length', '0'))
-        if length < 0 or length > MAX_FORM_BYTES:
-            raise ValueError('Слишком большой запрос')
-        data = self.rfile.read(length).decode('utf-8', errors='replace')
-        return {k: v[-1] for k, v in urllib.parse.parse_qs(data).items()}
-
-    def send_html(self, body: bytes, status: int = 200, cookie: str | None = None) -> None:
-        self.send_response(status)
-        self.send_header('Content-Type', 'text/html; charset=utf-8')
-        self.send_header('Content-Length', str(len(body)))
-        self.send_header('X-Frame-Options', 'DENY')
-        self.send_header('Content-Security-Policy', "default-src 'self' 'unsafe-inline'")
-        self.send_header('Cache-Control', 'no-store')
-        if cookie:
-            self.send_header('Set-Cookie', cookie)
-        self.end_headers(); self.wfile.write(body)
-
-    def redirect(self, path: str, cookie: str | None = None) -> None:
-        # PRG: every POST returns 303 -> GET, so browser refresh never asks to resend form data.
-        self.send_response(303); self.send_header('Location', path)
-        if cookie:
-            self.send_header('Set-Cookie', cookie)
-        self.end_headers()
-
-    def authenticated(self) -> tuple[str | None, dict[str, Any] | None]:
-        return session_from_cookie(self.headers.get('Cookie'))
-
-    def require_auth(self) -> tuple[str, dict[str, Any]] | None:
-        token, session = self.authenticated()
-        if not token or not session:
-            self.redirect('/login'); return None
-        return token, session
-
-    def check_csrf(self, form: dict[str, str], session: dict[str, Any]) -> bool:
-        return hmac.compare_digest(form.get('csrf', ''), session['csrf'])
-
-    def do_GET(self) -> None:
-        if self.path == '/login':
-            self.login_page(); return
-        if self.path != '/':
-            self.send_error(404); return
-        auth = self.require_auth()
-        if auth:
-            self.dashboard(auth[1])
-
-    def do_POST(self) -> None:
-        if self.path == '/login':
-            form = self.read_form()
-            if check_password(form.get('password', '')):
-                token, _ = create_session()
-                self.redirect('/', f'panel_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL}')
-            else:
-                self.redirect('/login')
-            return
-        auth = self.require_auth()
-        if not auth:
-            return
-        token, session = auth
-        form = self.read_form()
-        if not self.check_csrf(form, session):
-            with OPERATION_LOCK:
-                OPERATION_STATE.update({'running': False, 'message': '', 'error': 'CSRF-проверка не пройдена', 'updated_at': time.time()})
-            self.redirect('/'); return
-        try:
-            if self.path == '/logout':
-                SESSIONS.pop(token, None)
-                self.redirect('/login', 'panel_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'); return
-            if self.path == '/cascade/apply':
-                start_operation('Применение VLESS-профиля', apply_cascade, form.get('vless_uri', ''), form.get('profile_name', ''))
-                self.redirect('/'); return
-            if self.path == '/cascade/switch':
-                start_operation('Переключение VLESS-профиля', switch_cascade_profile, form.get('profile_name', ''))
-                self.redirect('/'); return
-            if self.path == '/cascade/delete':
-                start_operation('Удаление VLESS-профиля', delete_cascade_profile, form.get('profile_name', ''))
-                self.redirect('/'); return
-            if self.path == '/cascade/disable':
-                start_operation('Остановка каскада', disable_cascade)
-                self.redirect('/'); return
-            if self.path == '/settings/tls-domain':
-                start_operation('Смена Fake TLS SNI', apply_tls_domain, form.get('tls_domain', ''))
-                self.redirect('/'); return
-            if self.path == '/settings/password':
-                with OPERATION_LOCK:
-                    OPERATION_STATE.update({'running': False, 'message': apply_admin_password(
-                        form.get('current_password', ''),
-                        form.get('new_password', ''),
-                        form.get('confirm_password', ''),
-                    ), 'error': '', 'updated_at': time.time()})
-                self.redirect('/'); return
-            if self.path == '/users/create':
-                username = form.get('username', '').strip()
-                if not USERNAME_RE.fullmatch(username):
-                    raise ValueError('Имя: 1–64 символа A-Z, a-z, 0-9, _, . или -')
-                if not is_active('telemt.service'):
-                    raise ValueError('Сначала примените рабочий VLESS+REALITY каскад и запустите telemt')
-                status, response = telemt_request('/v1/users', 'POST', {'username': username}, timeout=API_WRITE_TIMEOUT)
-                problem = response.get('error', response) if isinstance(response, dict) else response
-                if status not in (201, 202):
-                    if isinstance(problem, dict) and problem.get('code') == 'user_exists':
-                        with OPERATION_LOCK:
-                            OPERATION_STATE.update({'running': False, 'message': f'Доступ {username} уже существует. Используйте ссылку ниже или обновите secret.', 'error': '', 'updated_at': time.time()})
-                        self.redirect('/'); return
-                    raise ValueError('telemt не создал пользователя: ' + str(problem))
-                with OPERATION_LOCK:
-                    OPERATION_STATE.update({'running': False, 'message': f'Доступ {username} создан. Ссылка появилась в списке ниже.', 'error': '', 'updated_at': time.time()})
-                self.redirect('/'); return
-            if self.path == '/users/delete':
-                username = form.get('username', '')
-                if username == 'bootstrap':
-                    raise ValueError('Системного пользователя bootstrap удалять нельзя')
-                status, response = telemt_request('/v1/users/' + urllib.parse.quote(username), 'DELETE', timeout=API_WRITE_TIMEOUT)
-                if status not in (200, 202):
-                    raise ValueError('telemt не удалил пользователя: ' + str(response.get('error', response)))
-                with OPERATION_LOCK:
-                    OPERATION_STATE.update({'running': False, 'message': f'Доступ {username} удалён.', 'error': '', 'updated_at': time.time()})
-                self.redirect('/'); return
-            if self.path == '/users/rotate':
-                username = form.get('username', '')
-                status, response = telemt_request('/v1/users/' + urllib.parse.quote(username) + '/rotate-secret', 'POST', {}, timeout=API_WRITE_TIMEOUT)
-                if status not in (200, 202):
-                    raise ValueError('telemt не обновил secret: ' + str(response.get('error', response)))
-                with OPERATION_LOCK:
-                    OPERATION_STATE.update({'running': False, 'message': f'Secret пользователя {username} обновлён; старая ссылка больше не действует.', 'error': '', 'updated_at': time.time()})
-                self.redirect('/'); return
-            self.send_error(404)
-        except Exception as exc:
-            with OPERATION_LOCK:
-                OPERATION_STATE.update({'running': False, 'message': '', 'error': str(exc), 'updated_at': time.time()})
-            self.redirect('/')
-
-    def login_page(self, error: str | None = None) -> None:
-        flash = f'<div class="flash error">{esc(error)}</div>' if error else ''
-        content = f'''<div style="max-width:420px;margin:90px auto"><div class="card"><h1>MTProxy Panel</h1><p class="muted">telemt + REALITY cascade</p>{flash}<form method="post" action="/login"><label>Пароль администратора</label><input type="password" name="password" autofocus required><button type="submit">Войти</button></form></div></div>'''
-        self.send_html(render_layout(content, 'Вход — MTProxy Panel'))
-
-    def dashboard(self, session: dict[str, Any], message: str | None = None, error: str | None = None) -> None:
-        settings = load_settings()
-        recovered = not bool(settings.get('cascade'))
-        cascade = settings.get('cascade') or infer_cascade_summary()
-        telemt_up = is_active('telemt.service')
-        xray_up = is_active('xray-cascade.service')
-        ready_status, ready = telemt_request('/v1/health/ready', timeout=API_READ_TIMEOUT) if telemt_up and cascade and xray_up else (0, {})
-        ready_data = ready.get('data', {}) if isinstance(ready, dict) else {}
-        ready_ok = bool(cascade) and xray_up and ready_status == 200 and ready_data.get('ready') is True
-        users: list[dict[str, Any]] = []
-        if telemt_up:
-            _, response = telemt_request('/v1/users', timeout=API_READ_TIMEOUT)
-            users = response.get('data', []) if isinstance(response, dict) else []
-        csrf = esc(session['csrf'])
-        operation = operation_snapshot()
-        flash = ''
-        if operation.get('running'):
-            flash = f'<div class="flash">Выполняется: {esc(operation["label"])}. Страница обновится автоматически.</div>'
-        elif operation.get('error') and not error:
-            flash = f'<div class="flash error">{esc(operation["error"])}</div>'
-        elif operation.get('message') and not message:
-            flash = f'<div class="flash">{esc(operation["message"])}</div>'
-        if message:
-            flash = f'<div class="flash">{esc(message)}</div>'
-        if error:
-            flash = f'<div class="flash error">{esc(error)}</div>'
-        recovered_note = ' (восстановлено из Xray config)' if cascade and recovered else ''
-        ingress_local_ok = tcp_probe('127.0.0.1', 443)
-        cascade_text = 'не настроен' if not cascade else f"{esc(cascade['endpoint'])} / {esc(cascade.get('security', '-'))} / {esc(cascade.get('network', '-'))} / SNI {esc(cascade.get('sni', '-'))} / fp {esc(cascade.get('fingerprint', '-'))}{recovered_note}"
-        status = f'''<div class="card"><h2>Состояние маршрута</h2><div class="row"><span class="pill">Xray cascade: <span class="{'ok' if xray_up else 'bad'}">{'ACTIVE' if xray_up else 'OFF'}</span></span><span class="pill">telemt: <span class="{'ok' if telemt_up else 'bad'}">{'ACTIVE' if telemt_up else 'OFF'}</span></span><span class="pill">Local :443: <span class="{'ok' if ingress_local_ok else 'bad'}">{'LISTEN' if ingress_local_ok else 'CLOSED'}</span></span><span class="pill">Server → Telegram: <span class="{'ok' if ready_ok else 'bad'}">{'READY' if ready_ok else 'NOT READY'}</span></span><span class="pill">External client test: <span class="warn">CHECK MANUALLY</span></span></div><p class="muted">Каскад: {cascade_text}</p><p class="hint muted"><b>Важно:</b> зелёный <code>Server → Telegram</code> доказывает только серверный маршрут telemt → VLESS → Telegram DC. Он не доказывает внешний вход: Telegram-клиент из РФ должен сам пройти участок <code>клиент → {esc(settings['public_host'])}:443 / Fake TLS</code>. Если в Telegram нет соединения при зелёных статусах, проверяйте внешний TCP 443, актуальный secret после смены SNI и блокировку Fake TLS/SNI оператором.</p></div>'''
-        active_profile = settings.get('active_cascade_profile') or '-'
-        cascade_badge = '<p class="bad">VLESS профиль не выбран</p>' if not cascade else f'''<p class="ok">Активный VLESS профиль: {esc(active_profile)}</p><p class="hint muted"><b>Текущий маршрут:</b><br>endpoint: <code>{esc(cascade.get('endpoint', '-'))}</code><br>security/type: <code>{esc(cascade.get('security', '-'))}/{esc(cascade.get('network', '-'))}</code><br>SNI: <code>{esc(cascade.get('sni', '-'))}</code><br>flow: <code>{esc(cascade.get('flow', 'none'))}</code></p>'''
-        profile_rows = ''
-        for profile in settings.get('cascade_profiles') or []:
-            if not isinstance(profile, dict):
-                continue
-            profile_name = str(profile.get('name') or '')
-            summary = profile.get('summary') or {}
-            active_mark = ' ✓ активен' if profile_name == active_profile else ''
-            profile_rows += f'''<div class="user"><b>{esc(profile_name)}{active_mark}</b><p class="hint muted">{esc(summary.get('endpoint', '-'))} / {esc(summary.get('security', '-'))}/{esc(summary.get('network', '-'))} / SNI {esc(summary.get('sni', '-'))}</p><form class="inline" method="post" action="/cascade/switch"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="profile_name" value="{esc(profile_name)}"><button class="secondary" type="submit">Включить</button></form> <form class="inline" method="post" action="/cascade/delete"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="profile_name" value="{esc(profile_name)}"><button class="danger" type="submit">Удалить</button></form></div>'''
-        if not profile_rows:
-            profile_rows = '<p class="muted">VLESS-профилей пока нет.</p>'
-        cascade_form = f'''<div class="card"><h2>VLESS каскады</h2>{cascade_badge}<p class="muted">Добавляйте несколько VLESS-ключей и переключайтесь между ними для проверки разных EGRESS/transport-вариантов. Поддерживаются common-ссылки: REALITY/TLS/none и raw/tcp/ws/grpc/httpupgrade/xhttp/http. Итоговую валидность проверяет Xray.</p><form method="post" action="/cascade/apply"><input type="hidden" name="csrf" value="{csrf}"><label>Название профиля</label><input name="profile_name" placeholder="egress-1 reality raw"><label>VLESS URL</label><textarea name="vless_uri" placeholder="vless://UUID@host:443?... любой common VLESS share-link" required></textarea><button type="submit">Сохранить и включить VLESS профиль</button></form><h3 style="margin-top:18px">Сохранённые профили</h3>{profile_rows}<form method="post" action="/cascade/disable" style="margin-top:12px"><input type="hidden" name="csrf" value="{csrf}"><button class="danger" type="submit">Остановить каскад</button></form></div>'''
-        settings_card = f'''<div class="card"><h2>Настройки Proxy</h2><p class="muted">Домен в ссылках задан при установке: <code>{esc(settings['public_host'])}</code>. Здесь меняются параметры, которые не должны спрашиваться в installer.</p><form method="post" action="/settings/tls-domain"><input type="hidden" name="csrf" value="{csrf}"><label>Fake TLS SNI для tg://proxy ссылок</label><input name="tls_domain" value="{esc(settings['tls_domain'])}" placeholder="max.ru" required><button type="submit">Сохранить SNI</button></form><hr style="border:0;border-top:1px solid var(--line);margin:18px 0"><form method="post" action="/settings/password"><input type="hidden" name="csrf" value="{csrf}"><label>Текущий пароль администратора</label><input type="password" name="current_password" required><label>Новый пароль администратора</label><input type="password" name="new_password" minlength="12" required><label>Подтверждение нового пароля</label><input type="password" name="confirm_password" minlength="12" required><button type="submit">Сменить пароль</button></form></div>'''
-        user_rows = ''
-        link_index = 0
-        for user in users:
-            username = user.get('username', '')
-            if username == 'bootstrap':
-                continue
-            proxy_links = collect_proxy_links(user, settings)
-            if proxy_links:
-                link_parts = []
-                for link in proxy_links:
-                    link_index += 1
-                    element_id = f'proxy_link_{link_index}'
-                    link_parts.append(f'''<div class="copyline"><input id="{element_id}" readonly value="{esc(link)}"><button class="secondary" type="button" onclick="copyById('{element_id}')">Копировать</button><a class="pill" href="{esc(link)}">Открыть Telegram</a></div>''')
-                link_html = ''.join(link_parts)
-            else:
-                link_html = '<span class="muted">ссылка ещё не построена</span>'
-            user_rows += f'''<div class="user"><div class="row"><b>{esc(username)}</b><form class="inline" method="post" action="/users/rotate"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="username" value="{esc(username)}"><button class="secondary" type="submit">Новый secret</button></form><form class="inline" method="post" action="/users/delete"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="username" value="{esc(username)}"><button class="danger" type="submit">Удалить</button></form></div>{link_html}<p class="hint muted">Копируйте именно полную tg://proxy ссылку. После смены Fake TLS SNI обязательно нажмите «Новый secret» и копируйте новую ссылку.</p></div>'''
-        if not user_rows:
-            user_rows = '<p class="muted">Клиентских доступов пока нет.</p>'
-        users_card = f'''<div class="card"><h2>Доступы Telegram Proxy</h2><form method="post" action="/users/create"><input type="hidden" name="csrf" value="{csrf}"><label>Имя нового доступа</label><div class="row"><input style="flex:1;margin:6px 0" name="username" placeholder="client_001" pattern="[A-Za-z0-9_.-]{{1,64}}" required><button type="submit">Создать ссылку</button></div></form>{user_rows}</div>'''
-        check_cmd = f'nc -vz {settings["public_host"]} 443'
-        diag_card = f'''<div class="card"><h2>Диагностика, если Telegram не подключается</h2><p class="hint muted">Проверку входа нужно делать <b>не с этого VPS</b>, а с телефона/домашнего ПК из той сети, где не работает Telegram. Серверный READY этого не проверяет.</p><div class="copyline"><input id="diag_cmd" readonly value="{esc(check_cmd)}"><button class="secondary" type="button" onclick="copyById('diag_cmd')">Копировать команду</button></div><p class="hint muted">Если TCP 443 доступен, но Telegram не подключается — основной подозреваемый: Fake TLS fingerprint/SNI. Попробуйте SNI <code>max.ru</code>, затем нажмите «Новый secret» у доступа и скопируйте новую ссылку.</p></div>'''
-        top = f'''<div class="top"><div><h1>MTProxy Panel</h1><div class="muted">telemt {esc(settings['telemt_version'])} · Xray {esc(settings['xray_version'])} · Fake TLS SNI {esc(settings['tls_domain'])}</div></div><form method="post" action="/logout"><input type="hidden" name="csrf" value="{csrf}"><button class="secondary" type="submit">Выйти</button></form></div>'''
-        auto_refresh = '<script>setTimeout(()=>location.reload(), 1500)</script>' if operation.get('running') else ''
-        content = top + flash + status + '<div class="grid">' + settings_card + cascade_form + users_card + diag_card + '</div>' + auto_refresh
-        self.send_html(render_layout(content))
-
-
-class PanelHTTPServer(ThreadingHTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-    request_queue_size = 64
-
-
-def main() -> None:
-    settings = load_settings()
-    host, port = settings['listen'].rsplit(':', 1)
-    server = PanelHTTPServer((host, int(port)), Handler)
-    print(f"MTProxy Panel listening on {settings['listen']}", flush=True)
-    server.serve_forever(poll_interval=0.25)
-
-
-if __name__ == '__main__':
-    main()
 PYAPP
-chmod 0750 /opt/mtproxy-panel/app.py
 
-cat > /etc/systemd/system/mtproxy-panel.service <<EOF
+cat > "${APP_DIR}/requirements.txt" <<'REQ'
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+REQ
+
+python3 -m venv "${APP_DIR}/venv"
+"${APP_DIR}/venv/bin/pip" install --upgrade pip wheel
+"${APP_DIR}/venv/bin/pip" install -r "${APP_DIR}/requirements.txt"
+
+cat > "${APP_DIR}/panel.env" <<ENV
+PANEL_SECRET=${PANEL_SECRET}
+PUBLIC_IP=${PUBLIC_IP}
+TELEMT_IMAGE=ghcr.io/telemt/telemt:3.4.14
+SING_BOX_IMAGE=ghcr.io/sagernet/sing-box:latest
+ENV
+
+chmod 0600 "${APP_DIR}/panel.env"
+chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
+
+cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<UNIT
 [Unit]
-Description=MTProxy telemt REALITY admin panel
-After=network-online.target
-Wants=network-online.target
+Description=TeleMT Cascade Test Panel
+After=network-online.target docker.service
+Wants=network-online.target docker.service
 
 [Service]
 Type=simple
 User=root
-Group=root
-WorkingDirectory=/opt/mtproxy-panel
-ExecStart=/usr/bin/python3 /opt/mtproxy-panel/app.py
-Restart=on-failure
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=${APP_DIR}/panel.env
+ExecStart=${APP_DIR}/venv/bin/uvicorn app:app --host 0.0.0.0 --port ${APP_PORT}
+Restart=always
 RestartSec=3
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectHome=true
-ProtectSystem=strict
-ReadOnlyPaths=/opt/mtproxy-panel
-ReadWritePaths=/etc/mtproxy-panel /etc/telemt /etc/xray-cascade /var/lib/xray-cascade
 
 [Install]
 WantedBy=multi-user.target
-EOF
+UNIT
 
-# Verify the embedded Python application before enabling anything.
-python3 -m py_compile /opt/mtproxy-panel/app.py
-
-log "8/10" "Применяю systemd-конфигурацию и очищаю конфликтующие overrides"
-rm -rf /etc/systemd/system/mtproxy-panel.service.d
 systemctl daemon-reload
-systemctl enable mtproxy-panel.service xray-cascade.service telemt.service >/dev/null 2>&1 || true
-systemctl restart mtproxy-panel.service
-systemctl is-active --quiet mtproxy-panel.service || die "Панель не запустилась; проверьте journalctl -u mtproxy-panel"
+systemctl enable --now "${SERVICE_NAME}"
 
-if [[ -s /etc/xray-cascade/client.json ]]; then
-  systemctl restart xray-cascade.service || true
-  systemctl restart telemt.service || true
-else
-  systemctl stop telemt.service xray-cascade.service >/dev/null 2>&1 || true
-fi
+ufw allow "${APP_PORT}/tcp" >/dev/null 2>&1 || true
+ufw allow 443/tcp >/dev/null 2>&1 || true
 
-# Для тестовой публичной панели открываем порт в UFW только если UFW уже установлен и активен.
-if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "^Status: active"; then
-  ufw allow "${PANEL_PORT}/tcp" comment "MTProxy test admin panel" >/dev/null
-fi
-
-log "9/10" "Проверяю установленные версии"
-/usr/local/bin/telemt --version 2>/dev/null || true
-/usr/local/bin/xray version | head -n 1 || true
-
-PANEL_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-if [[ -z "${PANEL_IP:-}" ]]; then
-  PANEL_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
-fi
-PANEL_URL_BY_IP="http://${PANEL_IP:-IP_СЕРВЕРА}:${PANEL_PORT}"
-PANEL_URL_BY_DOMAIN="http://${PUBLIC_HOST}:${PANEL_PORT}"
-
-log "10/10" "Готово: установлен MTProxy ingress; дальнейшая настройка выполняется в UI"
-cat <<EOF
-
-Установлено:
-  Panel:  v${APP_VERSION}, 0.0.0.0:${PANEL_PORT}
-  telemt: ${TELEMT_VERSION} (pinned; релиз 3.4.14 с JA3/JA4 диагностикой; пока остановлен до настройки каскада)
-  Xray:   ${XRAY_VERSION} (pinned; пока остановлен до настройки каскада)
-
-Адрес в tg://proxy ссылках: ${PUBLIC_HOST}:443
-Стартовый Fake TLS SNI:    ${TLS_DOMAIN} (по умолчанию max.ru; изменяется в UI)
-
-Доступ к панели для проверки — можно копировать прямо в браузер:
-  ${PANEL_URL_BY_IP}
-  ${PANEL_URL_BY_DOMAIN}
-
-Логин панели:
-  admin
-
-Пароль панели:
-$(if [[ "$EXISTING_PANEL_SETTINGS" -eq 1 ]]; then
-    printf '  Сохранён из предыдущей установки (используйте текущий пароль).'
-  else
-    printf '  %s' "$ADMIN_PASSWORD"
-  fi)
-
-Если используете cloud firewall/security group — откройте входящий TCP ${PANEL_PORT}.
-ВАЖНО: это HTTP-доступ для тестирования; не оставляйте порт публичным для production.
-
-Первый запуск:
-  1) Откройте панель по адресу http://IP_СЕРВЕРА:${PANEL_PORT}.
-  2) В UI проверьте Fake TLS SNI max.ru и смените временный пароль администратора.
-  3) Добавьте один или несколько VLESS-профилей зарубежных EGRESS VPS.
-  4) Переключайтесь между VLESS-профилями и дождитесь Server → Telegram: READY.
-  5) Создавайте клиентские доступы; панель выдаст tg://proxy ссылки.
-
-Схема маршрута:
-  Telegram -> telemt:443 -> 127.0.0.1:1080/Xray -> VLESS -> EGRESS VPS -> Telegram DC
-
-Проверка логов:
-  journalctl -u mtproxy-panel -u xray-cascade -u telemt -f
-EOF
+echo
+echo "============================================================"
+echo " TeleMT Cascade Test Panel installed"
+echo "============================================================"
+echo " Panel:    http://${PUBLIC_IP}:${APP_PORT}"
+echo " Login:    admin"
+echo " Password: ${PANEL_SECRET}"
+echo
+echo " API status:"
+echo " curl -u admin:${PANEL_SECRET} http://${PUBLIC_IP}:${APP_PORT}/api/status"
+echo
+echo " Next:"
+echo " 1) Open panel"
+echo " 2) Add VLESS or SOCKS/HTTP route"
+echo " 3) Activate route"
+echo " 4) Press Start / apply"
+echo " 5) Copy generated Telegram proxy link"
+echo "============================================================"
