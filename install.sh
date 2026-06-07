@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 APP_NAME="telemt-wdtt-panel"
-APP_VERSION="0.1.1"
+APP_VERSION="0.2.0"
 PANEL_PORT="8787"
 TELEMT_PORT="443"
 TELEMT_API_LISTEN="127.0.0.1:9091"
@@ -59,7 +59,7 @@ install_packages() {
   apt-get install -y \
     ca-certificates curl wget jq openssl tar gzip xz-utils unzip \
     python3 python3-venv python3-pip \
-    iproute2 net-tools lsof ufw git sshpass
+    iproute2 net-tools lsof ufw git sshpass golang-go wireguard-tools iptables nftables
 }
 
 install_telemt_binary() {
@@ -199,7 +199,7 @@ import requests
 from flask import Flask, flash, redirect, render_template_string, request, session, url_for
 from werkzeug.security import check_password_hash
 
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.2.0"
 BASE_DIR = Path("/opt/telemt-panel")
 DB_PATH = Path(os.environ.get("PANEL_DB", "/var/lib/telemt-panel/panel.sqlite3"))
 TELEMT_CONFIG = Path(os.environ.get("TELEMT_CONFIG", "/etc/telemt/telemt.toml"))
@@ -211,6 +211,15 @@ DEFAULT_TELEMT_PORT = 443
 DEFAULT_CASCADE_DTLS = 56000
 DEFAULT_CASCADE_WG = 56001
 DEFAULT_CASCADE_TUN = 9000
+
+PWDTT_ENV = Path(os.environ.get("PWDTT_ENV", "/etc/pwdtt-client/client.env"))
+PWDTT_SERVICE = "pwdtt-client"
+WG_IFACE = "wg-turn"
+TELEGRAM_ROUTE_CIDRS = [
+    "91.108.4.0/22", "91.108.8.0/22", "91.108.12.0/22",
+    "91.108.16.0/22", "91.108.20.0/22", "91.108.56.0/22",
+    "149.154.160.0/20",
+]
 
 app = Flask(__name__)
 app.secret_key = PANEL_SECRET_KEY
@@ -393,6 +402,9 @@ def get_statuses() -> list[dict[str, str]]:
         statuses.append(status_badge("Cascade WDTT", remote_state, detail))
     else:
         statuses.append(status_badge("Cascade WDTT", "unknown", "ещё не настроен"))
+
+    client_state, client_detail = pwdtt_client_state()
+    statuses.append(status_badge("WDTT client route", client_state, client_detail))
     return statuses
 
 
@@ -529,6 +541,113 @@ def remote_service_state(cascade: dict[str, Any], service: str, timeout: int = 8
         return "bad", f"remote systemd {active}"
     return "unknown", active
 
+
+
+
+def env_quote(value: Any) -> str:
+    raw = str(value)
+    return '"' + raw.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$') + '"'
+
+
+def pwdtt_service_active() -> bool:
+    return service_active(PWDTT_SERVICE)
+
+
+def pwdtt_client_state() -> tuple[str, str]:
+    route_mode = get_setting("route_mode", "direct")
+    active = pwdtt_service_active()
+    link_code, link_out = run(["ip", "-o", "link", "show", WG_IFACE], timeout=4)
+    route_code, route_out = run(["ip", "route", "get", TELEGRAM_DCS[0][0]], timeout=4)
+    has_link = link_code == 0
+    routed = route_code == 0 and WG_IFACE in route_out
+    if active and has_link and routed:
+        return "ok", f"client active, Telegram routes via {WG_IFACE}"
+    if active and has_link:
+        return "warn", f"client active, но Telegram route ещё не через {WG_IFACE}"
+    if active:
+        return "warn", "systemd active, wg-turn ещё не поднят / ждёт WDTT"
+    if route_mode == "cascade":
+        code, out = run(["systemctl", "is-active", PWDTT_SERVICE], timeout=4)
+        return "bad", f"client inactive: {out or 'not active'}"
+    return "unknown", "route direct, WDTT client выключен"
+
+
+def validate_cascade_for_client(cascade: dict[str, Any]) -> None:
+    if not cascade or not cascade.get("host"):
+        raise ValueError("Сначала укажи IP каскадного VPS")
+    if not cascade.get("main_password"):
+        raise ValueError("Не задан Main tunnel password")
+    if not cascade.get("vk_hashes"):
+        raise ValueError("Не заданы VK hash / join links. Без VK-хеша WDTT client не подключится")
+
+
+def write_pwdtt_client_env(cascade: dict[str, Any]) -> None:
+    validate_cascade_for_client(cascade)
+    PWDTT_ENV.parent.mkdir(parents=True, exist_ok=True)
+    host = str(cascade["host"]).strip()
+    dtls = int(cascade.get("dtls_port") or DEFAULT_CASCADE_DTLS)
+    tun = int(cascade.get("tun_port") or DEFAULT_CASCADE_TUN)
+    peer = f"{host}:{dtls}"
+    content = "\n".join([
+        f"WDTT_PEER_ADDR={env_quote(peer)}",
+        f"WDTT_PASSWORD={env_quote(cascade['main_password'])}",
+        f"WDTT_HASHES={env_quote(cascade['vk_hashes'])}",
+        f"WDTT_LISTEN={env_quote('127.0.0.1:' + str(tun))}",
+        f"WDTT_DEVICE_ID={env_quote('telemt-front')}",
+        "WDTT_WORKERS=9",
+        "WDTT_MTU=1280",
+        "",
+    ])
+    PWDTT_ENV.write_text(content)
+    PWDTT_ENV.chmod(0o600)
+
+
+def start_pwdtt_client(cascade: dict[str, Any]) -> str:
+    write_pwdtt_client_env(cascade)
+    run(["systemctl", "daemon-reload"], timeout=20)
+    # restart безопаснее: перечитает env и пересоберёт wg-turn/routes
+    code, out = run(["systemctl", "enable", "--now", PWDTT_SERVICE], timeout=35)
+    code2, out2 = run(["systemctl", "restart", PWDTT_SERVICE], timeout=35)
+    time.sleep(5)
+    check = check_pwdtt_client()
+    return f"enable exit={code}\n{out}\nrestart exit={code2}\n{out2}\n\n{check}"
+
+
+def stop_pwdtt_client() -> str:
+    code, out = run(["systemctl", "stop", PWDTT_SERVICE], timeout=35)
+    # На случай аварийного выхода без cleanup.
+    for cidr in TELEGRAM_ROUTE_CIDRS:
+        run(["ip", "route", "del", cidr, "dev", WG_IFACE], timeout=3)
+    run(["ip", "link", "del", WG_IFACE], timeout=5)
+    return f"stop exit={code}\n{out}"
+
+
+def restart_pwdtt_client() -> str:
+    cascade = get_cascade_row()
+    return start_pwdtt_client(cascade)
+
+
+def check_pwdtt_client() -> str:
+    code_status, status = run(["systemctl", "--no-pager", "--full", "status", PWDTT_SERVICE], timeout=10)
+    code_active, active = run(["systemctl", "is-active", PWDTT_SERVICE], timeout=5)
+    _, link = run(["ip", "addr", "show", WG_IFACE], timeout=5)
+    _, route = run(["ip", "route", "get", TELEGRAM_DCS[0][0]], timeout=5)
+    _, routes = run(["bash", "-lc", "ip route | grep -E '91\\.108|149\\.154|wg-turn' || true"], timeout=5)
+    _, udp = run(["bash", "-lc", "ss -lunp | grep -E ':(9000|56000|56001)\\s' || true"], timeout=5)
+    _, journal = run(["journalctl", "-u", PWDTT_SERVICE, "-n", "160", "--no-pager"], timeout=12)
+    _, env = run(["bash", "-lc", f"test -f {shlex.quote(str(PWDTT_ENV))} && sed -E 's/(WDTT_PASSWORD=).*/\\1***MASKED***/' {shlex.quote(str(PWDTT_ENV))} || true"], timeout=5)
+    state, detail = pwdtt_client_state()
+    return "\n".join([
+        f"=== pwdtt client state: {state} / {detail} ===",
+        f"=== env {PWDTT_ENV} ===", env,
+        "=== systemd active ===", f"exit={code_active} {active}",
+        "=== systemd status ===", f"exit={code_status}\n{status}",
+        f"=== {WG_IFACE} interface ===", link,
+        f"=== route get {TELEGRAM_DCS[0][0]} ===", route,
+        "=== telegram routes ===", routes,
+        "=== udp listeners ===", udp,
+        "=== journal ===", journal,
+    ])[-20000:]
 
 def get_cascade_row() -> dict[str, Any]:
     with db() as conn:
@@ -841,7 +960,15 @@ def cascade_deploy():
         if log.startswith("ERROR") or "exit=0" not in log:
             flash("Деплой завершился с ошибкой, смотри лог ниже", "bad")
         else:
-            flash("Cascade задеплоен и запущен", "ok")
+            try:
+                client_log = start_pwdtt_client(cascade)
+                set_setting("route_mode", "cascade")
+                with db() as conn:
+                    conn.execute("UPDATE cascade SET last_deploy_log=?, updated_at=? WHERE id=1", ((log + "\n\n=== local WDTT client ===\n" + client_log)[-20000:], now_iso()))
+                    conn.commit()
+                flash("Cascade-сервер задеплоен, WDTT-клиент запущен, маршрут Telegram включён", "ok")
+            except Exception as client_exc:
+                flash(f"Сервер cascade задеплоен, но WDTT-клиент не стартовал: {client_exc}", "bad")
     except Exception as exc:
         flash(f"Ошибка деплоя: {exc}", "bad")
     return redirect(url_for("index") + "#cascade")
@@ -877,12 +1004,52 @@ def route_cascade():
     mode = request.form.get("mode", "direct")
     if mode not in {"direct", "cascade"}:
         mode = "direct"
-    set_setting("route_mode", mode)
     if mode == "cascade":
-        flash("Режим cascade сохранён как future hook. Для реального заворота telemt нужен Linux WDTT-client/маршрутизация на front-сервере.", "warn")
+        try:
+            cascade = get_cascade_row()
+            log = start_pwdtt_client(cascade)
+            set_setting("route_mode", "cascade")
+            with db() as conn:
+                conn.execute("UPDATE cascade SET last_deploy_log=?, updated_at=? WHERE id=1", ((cascade.get("last_deploy_log", "") + "\n\n=== enable WDTT client route ===\n" + log)[-20000:], now_iso()))
+                conn.commit()
+            flash("Маршрут telemt → WDTT cascade включён", "ok")
+        except Exception as exc:
+            flash(f"Не удалось включить WDTT route: {exc}", "bad")
     else:
-        flash("Режим direct сохранён", "ok")
-    return redirect(url_for("index"))
+        log = stop_pwdtt_client()
+        set_setting("route_mode", "direct")
+        with db() as conn:
+            conn.execute("UPDATE cascade SET last_deploy_log=?, updated_at=? WHERE id=1", (log[-20000:], now_iso()))
+            conn.commit()
+        flash("WDTT client остановлен, режим direct", "ok")
+    return redirect(url_for("index") + "#route")
+
+
+@app.post("/pwdtt/client/action")
+def pwdtt_client_action():
+    action = request.form.get("action", "check")
+    try:
+        if action == "start":
+            log = start_pwdtt_client(get_cascade_row())
+            set_setting("route_mode", "cascade")
+            flash("WDTT client запущен, Telegram routes включены", "ok")
+        elif action == "restart":
+            log = restart_pwdtt_client()
+            set_setting("route_mode", "cascade")
+            flash("WDTT client перезапущен", "ok")
+        elif action == "stop":
+            log = stop_pwdtt_client()
+            set_setting("route_mode", "direct")
+            flash("WDTT client остановлен", "ok")
+        else:
+            log = check_pwdtt_client()
+            flash("Проверка WDTT client выполнена", "ok")
+        with db() as conn:
+            conn.execute("UPDATE cascade SET last_deploy_log=?, updated_at=? WHERE id=1", (log[-20000:], now_iso()))
+            conn.commit()
+    except Exception as exc:
+        flash(f"WDTT client: {exc}", "bad")
+    return redirect(url_for("index") + "#route")
 
 
 LOGIN_HTML = """
@@ -909,13 +1076,351 @@ INDEX_HTML = """
 <section class="card span8"><h2>Настройки telemt</h2><form method="post" action="{{ url_for('update_settings') }}"><div class="row"><div><label>Host/IP для tg-ссылок</label><input name="public_host" value="{{ public_host }}" required></div><div><label>FakeTLS SNI</label><input name="tls_domain" value="{{ tls_domain }}" required></div></div><button>Сохранить и перезапустить telemt</button></form><form method="post" action="{{ url_for('restart_telemt') }}"><button class="secondary">Только restart telemt</button></form></section>
 <section class="card span12"><h2>MTProto proxy-доступы</h2><form method="post" action="{{ url_for('create_access') }}" class="row"><div><label>Имя доступа</label><input name="username" placeholder="user1" required></div><div style="align-self:end"><button>Создать доступ</button></div></form><table><thead><tr><th>ID</th><th>Username</th><th>Secret</th><th>FakeTLS link</th><th></th></tr></thead><tbody>{% for a in accesses %}<tr><td>{{a.id}}</td><td>{{a.username}}</td><td class="mono">{{a.secret}}</td><td>{% if a.link_tls %}<div class="copy mono">{{a.link_tls}}</div>{% else %}<span class="muted">link появится после ответа telemt API</span>{% endif %}</td><td><form method="post" action="{{ url_for('delete_access', access_id=a.id) }}" onsubmit="return confirm('Удалить доступ?')"><button class="danger">Удалить</button></form></td></tr>{% endfor %}</tbody></table></section>
 <section class="card span12" id="cascade"><h2>Удалённый Cascade / WDTT deploy</h2><p class="muted">Укажи <b>IP второго VPS</b>. Панель подключится к нему по SSH, соберёт <code>wdtt-server</code>, создаст <code>wdtt.service</code>, откроет UDP-порты и покажет статус. Отдельного поля для public host больше нет: WDTT-ссылка автоматически использует этот же IP.</p><form method="post" action="{{ url_for('cascade_deploy') }}"><div class="row"><div><label>IP каскадного VPS для деплоя</label><input name="host" value="{{ cascade.host or '' }}" placeholder="например 123.45.67.89" required></div><div><label>SSH port</label><input type="number" name="ssh_port" value="{{ cascade.ssh_port or 22 }}"></div></div><div class="row"><div><label>SSH user</label><input name="ssh_user" value="{{ cascade.ssh_user or 'root' }}"></div><div><label>SSH password</label><input type="password" name="ssh_password" placeholder="оставь пустым, чтобы сохранить текущий"></div></div><div class="row"><div><label>Main tunnel password</label><input name="main_password" value="{{ cascade.main_password or '' }}" placeholder="если пусто — сгенерируется"></div><div><label>VK hash / join links, до 4 через запятую</label><input name="vk_hashes" value="{{ cascade.vk_hashes or '' }}" placeholder="vk.com/call/join/xxxxx"></div></div><div class="row"><div><label>Telegram admin_id, опционально</label><input name="telegram_admin_id" value="{{ cascade.telegram_admin_id or '' }}"></div><div><label>Telegram bot_token, опционально</label><input name="telegram_bot_token" value="{{ cascade.telegram_bot_token or '' }}"></div></div><div class="row"><div><label>DTLS UDP port</label><input type="number" name="dtls_port" value="{{ cascade.dtls_port or 56000 }}"></div><div><label>WG UDP port</label><input type="number" name="wg_port" value="{{ cascade.wg_port or 56001 }}"></div></div><label>Android/local TUN UDP port</label><input type="number" name="tun_port" value="{{ cascade.tun_port or 9000 }}"><button>Установить / переустановить cascade</button><button formaction="{{ url_for('cascade_save') }}" class="secondary">Только сохранить</button></form>{% if wdtt_link %}<h3>WDTT ссылка</h3><div class="copy mono">{{ wdtt_link }}</div>{% endif %}<form method="post" action="{{ url_for('cascade_check') }}"><button class="secondary">Проверить cascade</button></form><form method="post" action="{{ url_for('cascade_action') }}"><button name="action" value="start" class="secondary">Запустить cascade</button><button name="action" value="restart" class="secondary">Restart cascade</button><button name="action" value="stop" class="danger">Stop cascade</button></form>{% if cascade.last_deploy_log %}<h3>Последний deploy/check log</h3><textarea readonly class="mono" style="min-height:300px">{{ cascade.last_deploy_log }}</textarea>{% endif %}</section>
-<section class="card span12"><h2>Маршрут telemt</h2><p class="muted">Сейчас telemt установлен в direct-режиме. Для настоящего маршрута <code>telemt → WDTT cascade → Telegram</code> нужен Linux WDTT-client на front-сервере и policy routing только для процесса telemt. В этой версии это сохранено как future hook, чтобы не делать фальшивую кнопку.</p><form method="post" action="{{ url_for('route_cascade') }}"><select name="mode"><option value="direct" {% if route_mode == 'direct' %}selected{% endif %}>direct</option><option value="cascade" {% if route_mode == 'cascade' %}selected{% endif %}>cascade hook</option></select><button>Сохранить режим</button></form></section>
+<section class="card span12" id="route"><h2>Маршрут telemt через WDTT</h2><p class="muted">Этот блок запускает <b>Linux WDTT-client на front-сервере</b>, поднимает WireGuard-интерфейс <code>wg-turn</code> и добавляет маршруты Telegram DC через WDTT. В итоге цепочка становится: <code>Telegram client → VPS:443 → telemt → wg-turn/PWDTT → VK TURN/DTLS → WDTT server → Telegram</code>.</p><form method="post" action="{{ url_for('route_cascade') }}"><select name="mode"><option value="direct" {% if route_mode == 'direct' %}selected{% endif %}>direct: без WDTT-клиента</option><option value="cascade" {% if route_mode == 'cascade' %}selected{% endif %}>cascade: telemt через WDTT</option></select><button>Применить маршрут</button></form><form method="post" action="{{ url_for('pwdtt_client_action') }}"><button name="action" value="start" class="secondary">Запустить WDTT-клиент</button><button name="action" value="restart" class="secondary">Restart WDTT-клиент</button><button name="action" value="check" class="secondary">Проверить WDTT-клиент</button><button name="action" value="stop" class="danger">Stop WDTT-клиент</button></form><p class="muted">Если статус <b>Telegram DC</b> после запуска станет OK, значит Telegram-маршрут реально пошёл через <code>wg-turn</code>. Если будет BAD — смотри лог ниже, особенно строки captcha, wrong password, device mismatch, timeout.</p></section>
 </div><div class="footer">Config: /etc/telemt/telemt.toml · DB: /var/lib/telemt-panel/panel.sqlite3 · Logs: journalctl -u telemt-panel -f</div></div></body></html>
 """
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8787)
 PY_APP
+}
+
+install_pwdtt_headless() {
+  log "Installing PWDTT headless Linux client"
+  mkdir -p /opt /etc/pwdtt-client /var/log/pwdtt-client
+
+  if [[ -d /opt/PWDTT/.git ]]; then
+    git -C /opt/PWDTT fetch --all --prune || true
+    git -C /opt/PWDTT reset --hard origin/main || true
+  else
+    rm -rf /opt/PWDTT
+    git clone --depth=1 https://github.com/luminescq/PWDTT /opt/PWDTT
+  fi
+
+  mkdir -p /opt/pwdtt-headless
+  cat > /opt/pwdtt-headless/go.mod <<'EOF_GO_MOD'
+module pwdtt-headless
+
+go 1.25
+
+require wg-turn-client v0.0.0
+
+replace wg-turn-client => /opt/PWDTT/client
+EOF_GO_MOD
+
+  cat > /opt/pwdtt-headless/main.go <<'EOF_GO'
+package main
+
+import (
+	"bufio"
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"os/signal"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"wg-turn-client/core"
+)
+
+const wgIface = "wg-turn"
+
+var telegramCIDRs = []string{
+	"91.108.4.0/22",
+	"91.108.8.0/22",
+	"91.108.12.0/22",
+	"91.108.16.0/22",
+	"91.108.20.0/22",
+	"91.108.56.0/22",
+	"149.154.160.0/20",
+}
+
+var wgQuickOnlyFields = map[string]bool{
+	"address": true, "dns": true, "mtu": true,
+	"preup": true, "postup": true, "predown": true, "postdown": true,
+	"saveconfig": true,
+}
+
+func parseWGConfig(conf string) (addr, mtu string, allowedIPs []string, wgConf string) {
+	var out strings.Builder
+	scanner := bufio.NewScanner(strings.NewReader(conf))
+	for scanner.Scan() {
+		line := scanner.Text()
+		trimmed := strings.TrimSpace(line)
+		parts := strings.SplitN(trimmed, "=", 2)
+		if len(parts) == 2 {
+			key := strings.ToLower(strings.TrimSpace(parts[0]))
+			val := strings.TrimSpace(parts[1])
+			switch key {
+			case "address":
+				addr = val
+				continue
+			case "mtu":
+				mtu = val
+				continue
+			case "allowedips":
+				for _, cidr := range strings.Split(val, ",") {
+					if c := strings.TrimSpace(cidr); c != "" {
+						allowedIPs = append(allowedIPs, c)
+					}
+				}
+			default:
+				if wgQuickOnlyFields[key] {
+					continue
+				}
+			}
+		}
+		out.WriteString(line + "\n")
+	}
+	wgConf = out.String()
+	return
+}
+
+func run(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s %v: %w — %s", name, args, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func runIgnore(name string, args ...string) {
+	_ = exec.Command(name, args...).Run()
+}
+
+func teardownWG() {
+	for _, cidr := range telegramCIDRs {
+		runIgnore("ip", "route", "del", cidr, "dev", wgIface)
+	}
+	runIgnore("ip", "link", "del", wgIface)
+}
+
+func applyWGConfig(conf string) error {
+	addr, mtu, _, wgConf := parseWGConfig(conf)
+	if addr == "" {
+		return fmt.Errorf("Address not found in wg config")
+	}
+	teardownWG()
+	runIgnore("modprobe", "wireguard")
+
+	tmp, err := os.CreateTemp("", "pwdtt-wg-*.conf")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.WriteString(wgConf); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	_ = os.Chmod(tmpName, 0600)
+
+	if err := run("ip", "link", "add", wgIface, "type", "wireguard"); err != nil {
+		return fmt.Errorf("ip link add: %w", err)
+	}
+	if err := run("wg", "setconf", wgIface, tmpName); err != nil {
+		teardownWG()
+		return fmt.Errorf("wg setconf: %w", err)
+	}
+	runIgnore("ip", "addr", "flush", "dev", wgIface)
+	if err := run("ip", "addr", "add", addr, "dev", wgIface); err != nil {
+		teardownWG()
+		return fmt.Errorf("ip addr add: %w", err)
+	}
+	if mtu != "" {
+		runIgnore("ip", "link", "set", wgIface, "mtu", mtu)
+	}
+	if err := run("ip", "link", "set", wgIface, "up"); err != nil {
+		teardownWG()
+		return fmt.Errorf("ip link set up: %w", err)
+	}
+
+	for _, cidr := range telegramCIDRs {
+		if err := run("ip", "route", "replace", cidr, "dev", wgIface); err != nil {
+			log.Printf("[ROUTE] failed %s via %s: %v", cidr, wgIface, err)
+		} else {
+			log.Printf("[ROUTE] %s via %s", cidr, wgIface)
+		}
+	}
+	return nil
+}
+
+func normalizeHashes(raw string) []string {
+	var result []string
+	for _, part := range strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == ' ' || r == '\n' || r == '\t' }) {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		part = strings.Split(part, "?")[0]
+		part = strings.TrimRight(part, "/")
+		if idx := strings.LastIndex(part, "/"); idx >= 0 {
+			part = part[idx+1:]
+		}
+		if part != "" {
+			result = append(result, part)
+		}
+		if len(result) == 4 {
+			break
+		}
+	}
+	return result
+}
+
+func main() {
+	peer := flag.String("peer", os.Getenv("WDTT_PEER_ADDR"), "WDTT server ip:dtls_port")
+	password := flag.String("password", os.Getenv("WDTT_PASSWORD"), "WDTT password")
+	hashesRaw := flag.String("vk", os.Getenv("WDTT_HASHES"), "VK call hashes comma-separated")
+	listen := flag.String("listen", envDefault("WDTT_LISTEN", "127.0.0.1:9000"), "local UDP endpoint for WireGuard peer")
+	workers := flag.Int("workers", envInt("WDTT_WORKERS", 9), "worker count")
+	mtu := flag.Int("mtu", envInt("WDTT_MTU", 1280), "WireGuard MTU")
+	deviceID := flag.String("device-id", envDefault("WDTT_DEVICE_ID", "telemt-front"), "stable WDTT device id")
+	flag.Parse()
+
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	hashes := normalizeHashes(*hashesRaw)
+	if *peer == "" || *password == "" || len(hashes) == 0 {
+		log.Fatalf("missing required config: peer=%q password_set=%v hashes=%d", *peer, *password != "", len(hashes))
+	}
+
+	log.Printf("[PWDTT] starting peer=%s listen=%s hashes=%d workers=%d iface=%s", *peer, *listen, len(hashes), *workers, wgIface)
+	cfg := core.Config{
+		PeerAddr:    *peer,
+		Password:    *password,
+		Hashes:      hashes,
+		Listen:      *listen,
+		DeviceID:    *deviceID,
+		Workers:     *workers,
+		CaptchaMode: "auto",
+		MTU:         *mtu,
+	}
+	c := core.New(cfg)
+	events, err := c.Start()
+	if err != nil {
+		log.Fatalf("core start: %v", err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	var once sync.Once
+	shutdown := func() {
+		once.Do(func() {
+			log.Printf("[PWDTT] stopping")
+			c.Stop()
+			teardownWG()
+		})
+	}
+	go func() { <-ctx.Done(); shutdown() }()
+
+	lastStats := time.Now()
+	for ev := range events {
+		switch ev.Type {
+		case core.EventState:
+			log.Printf("[STATE] %s", ev.Status)
+		case core.EventLog:
+			log.Printf("[%s] %s", ev.Level, ev.Message)
+		case core.EventError:
+			log.Printf("[ERROR] %s", ev.Message)
+		case core.EventStats:
+			if time.Since(lastStats) > 20*time.Second {
+				lastStats = time.Now()
+				log.Printf("[STATS] rx=%d tx=%d workers=%d", ev.RxBytes, ev.TxBytes, ev.Workers)
+			}
+		case core.EventEvent:
+			if ev.Name == "wg_config" {
+				log.Printf("[WG] config received, applying telegram-only routes")
+				if err := applyWGConfig(ev.Data); err != nil {
+					log.Printf("[WG] apply failed: %v", err)
+				} else {
+					log.Printf("[WG] active: %s, Telegram routes enabled", wgIface)
+				}
+			} else if ev.Name == "captcha_required" {
+				log.Printf("[CAPTCHA] required: %s", ev.Data)
+			} else {
+				log.Printf("[EVENT] %s %s", ev.Name, ev.Data)
+			}
+		}
+	}
+	shutdown()
+	log.Printf("[PWDTT] exited")
+}
+
+func envDefault(key, def string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return def
+}
+
+func envInt(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	var i int
+	if _, err := fmt.Sscanf(v, "%d", &i); err != nil || i <= 0 {
+		return def
+	}
+	return i
+}
+EOF_GO
+
+  cd /opt/pwdtt-headless
+  go env -w GOTOOLCHAIN=auto
+  go mod tidy
+  GOFLAGS=-mod=mod go build -trimpath -ldflags='-s -w' -o /usr/local/bin/pwdtt-headless .
+  chmod 0755 /usr/local/bin/pwdtt-headless
+}
+
+create_pwdtt_client_service() {
+  log "Creating PWDTT client service"
+  mkdir -p /etc/pwdtt-client /var/log/pwdtt-client
+  if [[ ! -f /etc/pwdtt-client/client.env ]]; then
+    cat > /etc/pwdtt-client/client.env <<'EOF_PWDTT_ENV'
+WDTT_PEER_ADDR=""
+WDTT_PASSWORD=""
+WDTT_HASHES=""
+WDTT_LISTEN="127.0.0.1:9000"
+WDTT_DEVICE_ID="telemt-front"
+WDTT_WORKERS=9
+WDTT_MTU=1280
+EOF_PWDTT_ENV
+    chmod 0600 /etc/pwdtt-client/client.env
+  fi
+
+  cat > /etc/systemd/system/pwdtt-client.service <<'EOF_PWDTT_SERVICE'
+[Unit]
+Description=PWDTT headless Linux client for telemt Telegram routes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/pwdtt-client/client.env
+ExecStart=/usr/local/bin/pwdtt-headless -peer ${WDTT_PEER_ADDR} -password ${WDTT_PASSWORD} -vk ${WDTT_HASHES} -listen ${WDTT_LISTEN} -device-id ${WDTT_DEVICE_ID} -workers ${WDTT_WORKERS} -mtu ${WDTT_MTU}
+ExecStopPost=/bin/bash -lc 'for c in 91.108.4.0/22 91.108.8.0/22 91.108.12.0/22 91.108.16.0/22 91.108.20.0/22 91.108.56.0/22 149.154.160.0/20; do ip route del "$c" dev wg-turn 2>/dev/null || true; done; ip link del wg-turn 2>/dev/null || true'
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+EOF_PWDTT_SERVICE
+
+  systemctl daemon-reload
 }
 
 setup_panel_python() {
@@ -1054,6 +1559,8 @@ PY_MIGRATE
 update_existing_panel() {
   log "Existing installation detected: updating Flask panel only"
   install_packages
+  install_pwdtt_headless
+  create_pwdtt_client_service
   create_panel_app
   setup_panel_python
   create_panel_service
@@ -1068,6 +1575,8 @@ full_install() {
   create_telemt_config
   open_firewall
   wait_for_telemt
+  install_pwdtt_headless
+  create_pwdtt_client_service
   create_panel_app
   setup_panel_python
   create_panel_service
