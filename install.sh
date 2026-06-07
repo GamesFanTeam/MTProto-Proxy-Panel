@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 APP_NAME="telemt-wdtt-panel"
-APP_VERSION="0.2.0"
+APP_VERSION="0.2.1"
 PANEL_PORT="8787"
 TELEMT_PORT="443"
 TELEMT_API_LISTEN="127.0.0.1:9091"
@@ -59,7 +59,58 @@ install_packages() {
   apt-get install -y \
     ca-certificates curl wget jq openssl tar gzip xz-utils unzip \
     python3 python3-venv python3-pip \
-    iproute2 net-tools lsof ufw git sshpass golang-go wireguard-tools iptables nftables
+    iproute2 net-tools lsof ufw git sshpass wireguard-tools iptables nftables
+}
+
+install_go_toolchain() {
+  log "Installing official Go toolchain for WDTT/PWDTT builds"
+  local version arch goarch tarball url tmp expected actual
+  version="${GO_VERSION:-1.25.11}"
+  arch="$(dpkg --print-architecture)"
+  case "$arch" in
+    amd64)
+      goarch="amd64"
+      expected="34f14304e856893f4ba30c2cacfe93906e9de7915c5f6aaaf3a81cdccd7ba30b"
+      ;;
+    arm64)
+      goarch="arm64"
+      expected="c30bf9e156a54ea4e31fbbbf31a712b32734b58cc9a22426fa5ee632d0885124"
+      ;;
+    *)
+      die "Unsupported architecture for official Go install: $arch"
+      ;;
+  esac
+
+  if [[ -x /usr/local/go/bin/go ]]; then
+    local have
+    have="$(/usr/local/go/bin/go version | awk '{print $3}' | sed 's/^go//')"
+    if printf '%s\n%s\n' "1.25.0" "$have" | sort -V -C 2>/dev/null; then
+      log "Go $have already installed in /usr/local/go"
+      export PATH="/usr/local/go/bin:/usr/local/bin:$PATH"
+      /usr/local/go/bin/go env -w GOTOOLCHAIN=local >/dev/null 2>&1 || true
+      return 0
+    fi
+  fi
+
+  tmp="$(mktemp -d)"
+  tarball="$tmp/go${version}.linux-${goarch}.tar.gz"
+  url="https://go.dev/dl/go${version}.linux-${goarch}.tar.gz"
+  if ! curl -fsSL --retry 3 --connect-timeout 15 "$url" -o "$tarball"; then
+    curl -fsSL --retry 3 --connect-timeout 15 "https://dl.google.com/go/go${version}.linux-${goarch}.tar.gz" -o "$tarball"
+  fi
+  actual="$(sha256sum "$tarball" | awk '{print $1}')"
+  if [[ "$actual" != "$expected" ]]; then
+    rm -rf "$tmp"
+    die "Go checksum mismatch for go${version}.linux-${goarch}.tar.gz"
+  fi
+  rm -rf /usr/local/go
+  tar -C /usr/local -xzf "$tarball"
+  ln -sf /usr/local/go/bin/go /usr/local/bin/go
+  ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+  rm -rf "$tmp"
+  export PATH="/usr/local/go/bin:/usr/local/bin:$PATH"
+  /usr/local/go/bin/go env -w GOTOOLCHAIN=local
+  log "$(/usr/local/go/bin/go version)"
 }
 
 install_telemt_binary() {
@@ -199,7 +250,7 @@ import requests
 from flask import Flask, flash, redirect, render_template_string, request, session, url_for
 from werkzeug.security import check_password_hash
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 BASE_DIR = Path("/opt/telemt-panel")
 DB_PATH = Path(os.environ.get("PANEL_DB", "/var/lib/telemt-panel/panel.sqlite3"))
 TELEMT_CONFIG = Path(os.environ.get("TELEMT_CONFIG", "/etc/telemt/telemt.toml"))
@@ -728,7 +779,55 @@ def remote_deploy_script(cascade: dict[str, Any]) -> str:
 set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y ca-certificates curl git golang-go iproute2 iptables nftables
+apt-get install -y ca-certificates curl git tar gzip iproute2 iptables nftables
+install_go_toolchain() {{
+  local version arch goarch tarball url tmp expected actual
+  version="${{GO_VERSION:-1.25.11}}"
+  arch="$(dpkg --print-architecture)"
+  case "$arch" in
+    amd64)
+      goarch="amd64"
+      expected="34f14304e856893f4ba30c2cacfe93906e9de7915c5f6aaaf3a81cdccd7ba30b"
+      ;;
+    arm64)
+      goarch="arm64"
+      expected="c30bf9e156a54ea4e31fbbbf31a712b32734b58cc9a22426fa5ee632d0885124"
+      ;;
+    *)
+      echo "Unsupported architecture for official Go install: $arch" >&2
+      exit 1
+      ;;
+  esac
+  if [[ -x /usr/local/go/bin/go ]]; then
+    local have
+    have="$(/usr/local/go/bin/go version | awk '{{print $3}}' | sed 's/^go//')"
+    if printf '%s\n%s\n' "1.25.0" "$have" | sort -V -C 2>/dev/null; then
+      export PATH="/usr/local/go/bin:/usr/local/bin:$PATH"
+      /usr/local/go/bin/go env -w GOTOOLCHAIN=local >/dev/null 2>&1 || true
+      return 0
+    fi
+  fi
+  tmp="$(mktemp -d)"
+  tarball="$tmp/go${{version}}.linux-${{goarch}}.tar.gz"
+  url="https://go.dev/dl/go${{version}}.linux-${{goarch}}.tar.gz"
+  if ! curl -fsSL --retry 3 --connect-timeout 15 "$url" -o "$tarball"; then
+    curl -fsSL --retry 3 --connect-timeout 15 "https://dl.google.com/go/go${{version}}.linux-${{goarch}}.tar.gz" -o "$tarball"
+  fi
+  actual="$(sha256sum "$tarball" | awk '{{print $1}}')"
+  if [[ "$actual" != "$expected" ]]; then
+    echo "Go checksum mismatch for go${{version}}.linux-${{goarch}}.tar.gz" >&2
+    rm -rf "$tmp"
+    exit 1
+  fi
+  rm -rf /usr/local/go
+  tar -C /usr/local -xzf "$tarball"
+  ln -sf /usr/local/go/bin/go /usr/local/bin/go
+  ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+  rm -rf "$tmp"
+  export PATH="/usr/local/go/bin:/usr/local/bin:$PATH"
+  /usr/local/go/bin/go env -w GOTOOLCHAIN=local
+}}
+install_go_toolchain
 mkdir -p /opt /etc/wdtt /var/log/wdtt
 if [[ -d /opt/proxy-turn-vk-android/.git ]]; then
   git -C /opt/proxy-turn-vk-android fetch --all --prune
@@ -738,9 +837,9 @@ else
   git clone --depth=1 https://github.com/amurcanov/proxy-turn-vk-android /opt/proxy-turn-vk-android
 fi
 cd /opt/proxy-turn-vk-android
-go env -w GOTOOLCHAIN=auto
-go mod tidy
-GOFLAGS=-mod=mod go build -trimpath -ldflags='-s -w' -o /usr/local/bin/wdtt-server ./server.go
+/usr/local/go/bin/go env -w GOTOOLCHAIN=local
+/usr/local/go/bin/go mod tidy
+GOFLAGS=-mod=mod /usr/local/go/bin/go build -trimpath -ldflags='-s -w' -o /usr/local/bin/wdtt-server ./server.go
 chmod 0755 /usr/local/bin/wdtt-server
 cat > /etc/systemd/system/wdtt.service <<'EOF_WDTT_SERVICE'
 [Unit]
@@ -1101,7 +1200,7 @@ install_pwdtt_headless() {
   cat > /opt/pwdtt-headless/go.mod <<'EOF_GO_MOD'
 module pwdtt-headless
 
-go 1.25
+go 1.25.0
 
 require wg-turn-client v0.0.0
 
@@ -1375,9 +1474,9 @@ func envInt(key string, def int) int {
 EOF_GO
 
   cd /opt/pwdtt-headless
-  go env -w GOTOOLCHAIN=auto
-  go mod tidy
-  GOFLAGS=-mod=mod go build -trimpath -ldflags='-s -w' -o /usr/local/bin/pwdtt-headless .
+  /usr/local/go/bin/go env -w GOTOOLCHAIN=local
+  /usr/local/go/bin/go mod tidy
+  GOFLAGS=-mod=mod /usr/local/go/bin/go build -trimpath -ldflags='-s -w' -o /usr/local/bin/pwdtt-headless .
   chmod 0755 /usr/local/bin/pwdtt-headless
 }
 
@@ -1559,6 +1658,7 @@ PY_MIGRATE
 update_existing_panel() {
   log "Existing installation detected: updating Flask panel only"
   install_packages
+  install_go_toolchain
   install_pwdtt_headless
   create_pwdtt_client_service
   create_panel_app
@@ -1571,6 +1671,7 @@ update_existing_panel() {
 
 full_install() {
   install_packages
+  install_go_toolchain
   install_telemt_binary
   create_telemt_config
   open_firewall
