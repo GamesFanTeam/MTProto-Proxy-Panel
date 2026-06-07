@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 APP_NAME="telemt-wdtt-panel"
-APP_VERSION="0.2.1"
+APP_VERSION="0.2.2"
 PANEL_PORT="8787"
 TELEMT_PORT="443"
 TELEMT_API_LISTEN="127.0.0.1:9091"
@@ -59,6 +59,7 @@ install_packages() {
   apt-get install -y \
     ca-certificates curl wget jq openssl tar gzip xz-utils unzip \
     python3 python3-venv python3-pip \
+    build-essential libc6-dev pkg-config gcc g++ make \
     iproute2 net-tools lsof ufw git sshpass wireguard-tools iptables nftables
 }
 
@@ -250,7 +251,7 @@ import requests
 from flask import Flask, flash, redirect, render_template_string, request, session, url_for
 from werkzeug.security import check_password_hash
 
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.2.2"
 BASE_DIR = Path("/opt/telemt-panel")
 DB_PATH = Path(os.environ.get("PANEL_DB", "/var/lib/telemt-panel/panel.sqlite3"))
 TELEMT_CONFIG = Path(os.environ.get("TELEMT_CONFIG", "/etc/telemt/telemt.toml"))
@@ -779,7 +780,7 @@ def remote_deploy_script(cascade: dict[str, Any]) -> str:
 set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y ca-certificates curl git tar gzip iproute2 iptables nftables
+apt-get install -y ca-certificates curl git tar gzip iproute2 iptables nftables build-essential libc6-dev pkg-config gcc g++ make
 install_go_toolchain() {{
   local version arch goarch tarball url tmp expected actual
   version="${{GO_VERSION:-1.25.11}}"
