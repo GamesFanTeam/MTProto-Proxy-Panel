@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 APP_NAME="telemt-wdtt-panel"
-APP_VERSION="0.1.0-dev"
+APP_VERSION="0.1.1"
 PANEL_PORT="8787"
 TELEMT_PORT="443"
 TELEMT_API_LISTEN="127.0.0.1:9091"
@@ -199,7 +199,7 @@ import requests
 from flask import Flask, flash, redirect, render_template_string, request, session, url_for
 from werkzeug.security import check_password_hash
 
-APP_VERSION = "0.1.0-dev"
+APP_VERSION = "0.1.1"
 BASE_DIR = Path("/opt/telemt-panel")
 DB_PATH = Path(os.environ.get("PANEL_DB", "/var/lib/telemt-panel/panel.sqlite3"))
 TELEMT_CONFIG = Path(os.environ.get("TELEMT_CONFIG", "/etc/telemt/telemt.toml"))
@@ -510,12 +510,21 @@ def remote_exec(cascade: dict[str, Any], command: str, timeout: int = 60) -> tup
 
 
 def remote_service_state(cascade: dict[str, Any], service: str, timeout: int = 8) -> tuple[str, str]:
-    code, out = remote_exec(cascade, f"systemctl is-active {shlex.quote(service)} || true", timeout=timeout)
+    if not cascade or not cascade.get("host"):
+        return "unknown", "IP каскадного VPS не задан"
+    code, out = remote_exec(cascade, f"systemctl cat {shlex.quote(service)} >/dev/null 2>&1 && systemctl is-active {shlex.quote(service)} || echo not-installed", timeout=timeout)
     if code == 255:
-        return "bad", out
+        return "bad", f"SSH: {out}"
     active = out.splitlines()[-1].strip() if out.strip() else "unknown"
     if active == "active":
-        return "ok", "remote systemd active"
+        dtls = int(cascade.get("dtls_port") or DEFAULT_CASCADE_DTLS)
+        wg = int(cascade.get("wg_port") or DEFAULT_CASCADE_WG)
+        pcode, pout = remote_exec(cascade, f"ss -H -lunp | grep -E ':({dtls}|{wg})\\s' || true", timeout=timeout)
+        if pcode != 255 and str(dtls) in pout and str(wg) in pout:
+            return "ok", f"wdtt active, UDP {dtls}/{wg} слушают"
+        return "warn", f"wdtt active, но UDP listeners не подтверждены"
+    if active == "not-installed":
+        return "bad", "wdtt.service не установлен / сборка не завершилась"
     if active in {"inactive", "failed"}:
         return "bad", f"remote systemd {active}"
     return "unknown", active
@@ -530,7 +539,7 @@ def get_cascade_row() -> dict[str, Any]:
 def save_cascade_form(form: dict[str, str]) -> dict[str, Any]:
     fields = {
         "host": form.get("host", "").strip(),
-        "public_host": form.get("public_host", "").strip() or form.get("host", "").strip(),
+        "public_host": form.get("host", "").strip(),
         "ssh_port": int(form.get("ssh_port") or 22),
         "ssh_user": form.get("ssh_user", "root").strip() or "root",
         "ssh_password": form.get("ssh_password", ""),
@@ -544,7 +553,7 @@ def save_cascade_form(form: dict[str, str]) -> dict[str, Any]:
         "updated_at": now_iso(),
     }
     if not fields["host"]:
-        raise ValueError("Укажи host удалённого cascade VPS")
+        raise ValueError("Укажи IP каскадного VPS для деплоя")
     if not fields["ssh_password"]:
         # keep old password if user left it blank
         old = get_cascade_row()
@@ -610,8 +619,9 @@ else
   git clone --depth=1 https://github.com/amurcanov/proxy-turn-vk-android /opt/proxy-turn-vk-android
 fi
 cd /opt/proxy-turn-vk-android
-go mod download
-go build -trimpath -ldflags='-s -w' -o /usr/local/bin/wdtt-server ./server.go
+go env -w GOTOOLCHAIN=auto
+go mod tidy
+GOFLAGS=-mod=mod go build -trimpath -ldflags='-s -w' -o /usr/local/bin/wdtt-server ./server.go
 chmod 0755 /usr/local/bin/wdtt-server
 cat > /etc/systemd/system/wdtt.service <<'EOF_WDTT_SERVICE'
 [Unit]
@@ -666,13 +676,43 @@ def deploy_cascade(cascade: dict[str, Any]) -> str:
     return log
 
 
+def check_cascade(cascade: dict[str, Any]) -> str:
+    if not cascade or not cascade.get("host"):
+        return "ERROR: IP каскадного VPS не задан"
+    dtls = int(cascade.get("dtls_port") or DEFAULT_CASCADE_DTLS)
+    wg = int(cascade.get("wg_port") or DEFAULT_CASCADE_WG)
+    cmd = f"""
+set +e
+echo '=== host ==='
+hostname -f 2>/dev/null || hostname
+echo '=== wdtt service file ==='
+systemctl cat wdtt 2>&1
+echo '=== wdtt active ==='
+systemctl is-active wdtt 2>&1
+echo '=== wdtt status ==='
+systemctl --no-pager --full status wdtt 2>&1 | tail -80
+echo '=== udp listeners expected {dtls}/{wg} ==='
+ss -lunp 2>&1 | grep -E ':({dtls}|{wg})\\s' || true
+echo '=== last logs ==='
+journalctl -u wdtt -n 120 --no-pager 2>&1
+echo '=== firewall ==='
+ufw status verbose 2>/dev/null || true
+"""
+    code, out = remote_exec(cascade, cmd, timeout=90)
+    log = f"exit={code}\n{out}"
+    with db() as conn:
+        conn.execute("UPDATE cascade SET last_deploy_log=?, updated_at=? WHERE id=1", (log[-20000:], now_iso()))
+        conn.commit()
+    return log
+
+
 def require_login():
     return session.get("auth") is True
 
 
 @app.before_request
 def protect() -> Any:
-    if request.endpoint in {"login", "static"}:
+    if request.endpoint in {"login", "login_post", "static"}:
         return None
     if not require_login():
         return redirect(url_for("login"))
@@ -813,8 +853,22 @@ def cascade_action():
     if action not in {"start", "stop", "restart"}:
         action = "restart"
     cascade = get_cascade_row()
-    code, out = remote_exec(cascade, f"systemctl {action} wdtt && systemctl is-active wdtt", timeout=30)
-    flash(f"cascade {action}: {out}", "ok" if code == 0 else "bad")
+    if not cascade or not cascade.get("host"):
+        flash("Сначала укажи IP каскадного VPS и сохрани настройки", "bad")
+        return redirect(url_for("index") + "#cascade")
+    code, out = remote_exec(cascade, f"systemctl {action} wdtt && systemctl is-active wdtt; journalctl -u wdtt -n 40 --no-pager", timeout=45)
+    with db() as conn:
+        conn.execute("UPDATE cascade SET last_deploy_log=?, updated_at=? WHERE id=1", (f"action={action} exit={code}\n{out}"[-20000:], now_iso()))
+        conn.commit()
+    flash(f"cascade {action}: {out.splitlines()[0] if out else 'done'}", "ok" if code == 0 else "bad")
+    return redirect(url_for("index") + "#cascade")
+
+
+@app.post("/cascade/check")
+def cascade_check():
+    cascade = get_cascade_row()
+    log = check_cascade(cascade)
+    flash("Проверка cascade выполнена, смотри лог ниже", "ok" if not log.startswith("ERROR") else "bad")
     return redirect(url_for("index") + "#cascade")
 
 
@@ -854,7 +908,7 @@ INDEX_HTML = """
 <section class="card span4"><h2>Статусы</h2>{% for s in statuses %}<div class="status"><div><b>{{s.label}}</b><div class="detail">{{s.detail}}</div></div><span class="pill {{s.class}}">{{s.state}}</span></div>{% endfor %}</section>
 <section class="card span8"><h2>Настройки telemt</h2><form method="post" action="{{ url_for('update_settings') }}"><div class="row"><div><label>Host/IP для tg-ссылок</label><input name="public_host" value="{{ public_host }}" required></div><div><label>FakeTLS SNI</label><input name="tls_domain" value="{{ tls_domain }}" required></div></div><button>Сохранить и перезапустить telemt</button></form><form method="post" action="{{ url_for('restart_telemt') }}"><button class="secondary">Только restart telemt</button></form></section>
 <section class="card span12"><h2>MTProto proxy-доступы</h2><form method="post" action="{{ url_for('create_access') }}" class="row"><div><label>Имя доступа</label><input name="username" placeholder="user1" required></div><div style="align-self:end"><button>Создать доступ</button></div></form><table><thead><tr><th>ID</th><th>Username</th><th>Secret</th><th>FakeTLS link</th><th></th></tr></thead><tbody>{% for a in accesses %}<tr><td>{{a.id}}</td><td>{{a.username}}</td><td class="mono">{{a.secret}}</td><td>{% if a.link_tls %}<div class="copy mono">{{a.link_tls}}</div>{% else %}<span class="muted">link появится после ответа telemt API</span>{% endif %}</td><td><form method="post" action="{{ url_for('delete_access', access_id=a.id) }}" onsubmit="return confirm('Удалить доступ?')"><button class="danger">Удалить</button></form></td></tr>{% endfor %}</tbody></table></section>
-<section class="card span12" id="cascade"><h2>Удалённый Cascade / WDTT deploy</h2><p class="muted">Форма деплоит <code>wdtt-server</code> на удалённый VPS по SSH, создаёт <code>wdtt.service</code>, открывает UDP-порты и генерирует <code>wdtt://</code> ссылку. SSH-пароль хранится локально в SQLite панели с правами root.</p><form method="post" action="{{ url_for('cascade_deploy') }}"><div class="row"><div><label>Remote VPS host/IP</label><input name="host" value="{{ cascade.host or '' }}" required></div><div><label>Public host/IP для WDTT-ссылки</label><input name="public_host" value="{{ cascade.public_host or cascade.host or '' }}"></div></div><div class="row"><div><label>SSH user</label><input name="ssh_user" value="{{ cascade.ssh_user or 'root' }}"></div><div><label>SSH port</label><input type="number" name="ssh_port" value="{{ cascade.ssh_port or 22 }}"></div></div><label>SSH password</label><input type="password" name="ssh_password" placeholder="оставь пустым, чтобы сохранить текущий"><div class="row"><div><label>Main tunnel password</label><input name="main_password" value="{{ cascade.main_password or '' }}" placeholder="если пусто — сгенерируется"></div><div><label>VK hash / join links, до 4 через запятую</label><input name="vk_hashes" value="{{ cascade.vk_hashes or '' }}" placeholder="vk.com/call/join/xxxxx"></div></div><div class="row"><div><label>Telegram admin_id, опционально</label><input name="telegram_admin_id" value="{{ cascade.telegram_admin_id or '' }}"></div><div><label>Telegram bot_token, опционально</label><input name="telegram_bot_token" value="{{ cascade.telegram_bot_token or '' }}"></div></div><div class="row"><div><label>DTLS UDP port</label><input type="number" name="dtls_port" value="{{ cascade.dtls_port or 56000 }}"></div><div><label>WG UDP port</label><input type="number" name="wg_port" value="{{ cascade.wg_port or 56001 }}"></div></div><label>Android/local TUN UDP port</label><input type="number" name="tun_port" value="{{ cascade.tun_port or 9000 }}"><button>Установить / redeploy cascade</button><button formaction="{{ url_for('cascade_save') }}" class="secondary">Только сохранить</button></form>{% if wdtt_link %}<h3>WDTT ссылка</h3><div class="copy mono">{{ wdtt_link }}</div>{% endif %}<form method="post" action="{{ url_for('cascade_action') }}"><button name="action" value="start" class="secondary">Запустить cascade</button><button name="action" value="restart" class="secondary">Restart cascade</button><button name="action" value="stop" class="danger">Stop cascade</button></form>{% if cascade.last_deploy_log %}<h3>Последний deploy log</h3><textarea readonly class="mono" style="min-height:240px">{{ cascade.last_deploy_log }}</textarea>{% endif %}</section>
+<section class="card span12" id="cascade"><h2>Удалённый Cascade / WDTT deploy</h2><p class="muted">Укажи <b>IP второго VPS</b>. Панель подключится к нему по SSH, соберёт <code>wdtt-server</code>, создаст <code>wdtt.service</code>, откроет UDP-порты и покажет статус. Отдельного поля для public host больше нет: WDTT-ссылка автоматически использует этот же IP.</p><form method="post" action="{{ url_for('cascade_deploy') }}"><div class="row"><div><label>IP каскадного VPS для деплоя</label><input name="host" value="{{ cascade.host or '' }}" placeholder="например 123.45.67.89" required></div><div><label>SSH port</label><input type="number" name="ssh_port" value="{{ cascade.ssh_port or 22 }}"></div></div><div class="row"><div><label>SSH user</label><input name="ssh_user" value="{{ cascade.ssh_user or 'root' }}"></div><div><label>SSH password</label><input type="password" name="ssh_password" placeholder="оставь пустым, чтобы сохранить текущий"></div></div><div class="row"><div><label>Main tunnel password</label><input name="main_password" value="{{ cascade.main_password or '' }}" placeholder="если пусто — сгенерируется"></div><div><label>VK hash / join links, до 4 через запятую</label><input name="vk_hashes" value="{{ cascade.vk_hashes or '' }}" placeholder="vk.com/call/join/xxxxx"></div></div><div class="row"><div><label>Telegram admin_id, опционально</label><input name="telegram_admin_id" value="{{ cascade.telegram_admin_id or '' }}"></div><div><label>Telegram bot_token, опционально</label><input name="telegram_bot_token" value="{{ cascade.telegram_bot_token or '' }}"></div></div><div class="row"><div><label>DTLS UDP port</label><input type="number" name="dtls_port" value="{{ cascade.dtls_port or 56000 }}"></div><div><label>WG UDP port</label><input type="number" name="wg_port" value="{{ cascade.wg_port or 56001 }}"></div></div><label>Android/local TUN UDP port</label><input type="number" name="tun_port" value="{{ cascade.tun_port or 9000 }}"><button>Установить / переустановить cascade</button><button formaction="{{ url_for('cascade_save') }}" class="secondary">Только сохранить</button></form>{% if wdtt_link %}<h3>WDTT ссылка</h3><div class="copy mono">{{ wdtt_link }}</div>{% endif %}<form method="post" action="{{ url_for('cascade_check') }}"><button class="secondary">Проверить cascade</button></form><form method="post" action="{{ url_for('cascade_action') }}"><button name="action" value="start" class="secondary">Запустить cascade</button><button name="action" value="restart" class="secondary">Restart cascade</button><button name="action" value="stop" class="danger">Stop cascade</button></form>{% if cascade.last_deploy_log %}<h3>Последний deploy/check log</h3><textarea readonly class="mono" style="min-height:300px">{{ cascade.last_deploy_log }}</textarea>{% endif %}</section>
 <section class="card span12"><h2>Маршрут telemt</h2><p class="muted">Сейчас telemt установлен в direct-режиме. Для настоящего маршрута <code>telemt → WDTT cascade → Telegram</code> нужен Linux WDTT-client на front-сервере и policy routing только для процесса telemt. В этой версии это сохранено как future hook, чтобы не делать фальшивую кнопку.</p><form method="post" action="{{ url_for('route_cascade') }}"><select name="mode"><option value="direct" {% if route_mode == 'direct' %}selected{% endif %}>direct</option><option value="cascade" {% if route_mode == 'cascade' %}selected{% endif %}>cascade hook</option></select><button>Сохранить режим</button></form></section>
 </div><div class="footer">Config: /etc/telemt/telemt.toml · DB: /var/lib/telemt-panel/panel.sqlite3 · Logs: journalctl -u telemt-panel -f</div></div></body></html>
 """
@@ -875,7 +929,12 @@ setup_panel_python() {
 create_panel_service() {
   log "Creating panel service"
   local panel_password secret_key password_hash public_ip
-  panel_password="$(random_password)"
+  if [[ -s "$PANEL_STATE_DIR/panel-password.txt" ]]; then
+    panel_password="$(tr -d '\r\n' < "$PANEL_STATE_DIR/panel-password.txt")"
+    log "Preserving existing panel password"
+  else
+    panel_password="$(random_password)"
+  fi
   secret_key="$(random_hex 32)"
   password_hash="$($PANEL_DIR/venv/bin/python - <<PY
 from werkzeug.security import generate_password_hash
@@ -885,8 +944,8 @@ PY
   public_ip="$(get_public_ip)"
 
   cat > "$PANEL_ETC_DIR/panel.env" <<EOF_ENV
-PANEL_SECRET_KEY=${secret_key}
-PANEL_PASSWORD_HASH=${password_hash}
+PANEL_SECRET_KEY="${secret_key}"
+PANEL_PASSWORD_HASH="${password_hash}"
 PANEL_DB=${PANEL_STATE_DIR}/panel.sqlite3
 TELEMT_CONFIG=${TELEMT_CONFIG_FILE}
 TELEMT_API=http://${TELEMT_API_LISTEN}
@@ -976,11 +1035,34 @@ EOF_LINK
   fi
 }
 
-main() {
-  mkdir -p "$(dirname "$INSTALL_LOG")"
-  touch "$INSTALL_LOG"
-  require_root
-  require_ubuntu_2404
+migrate_existing_state() {
+  log "Migrating existing panel state"
+  "$PANEL_DIR/venv/bin/python" - <<'PY_MIGRATE' || true
+from pathlib import Path
+import sqlite3
+path = Path('/var/lib/telemt-panel/panel.sqlite3')
+if path.exists():
+    with sqlite3.connect(path) as conn:
+        try:
+            conn.execute("UPDATE cascade SET public_host = host WHERE id = 1 AND COALESCE(host, '') != ''")
+            conn.commit()
+        except sqlite3.Error:
+            pass
+PY_MIGRATE
+}
+
+update_existing_panel() {
+  log "Existing installation detected: updating Flask panel only"
+  install_packages
+  create_panel_app
+  setup_panel_python
+  create_panel_service
+  migrate_existing_state
+  systemctl restart telemt-panel
+  print_summary
+}
+
+full_install() {
   install_packages
   install_telemt_binary
   create_telemt_config
@@ -989,7 +1071,22 @@ main() {
   create_panel_app
   setup_panel_python
   create_panel_service
+  migrate_existing_state
   print_summary
+}
+
+main() {
+  mkdir -p "$(dirname "$INSTALL_LOG")"
+  touch "$INSTALL_LOG"
+  require_root
+  require_ubuntu_2404
+  if [[ "${1:-}" == "--force-full" ]]; then
+    full_install
+  elif [[ -f "$PANEL_DIR/app.py" && -f /etc/systemd/system/telemt-panel.service ]]; then
+    update_existing_panel
+  else
+    full_install
+  fi
 }
 
 main "$@"
