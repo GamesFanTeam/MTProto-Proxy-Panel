@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import secrets
 import sqlite3
 import subprocess
@@ -81,6 +82,8 @@ def init_db() -> None:
           is_active INTEGER NOT NULL DEFAULT 0,
           last_status TEXT NOT NULL DEFAULT 'unknown',
           last_error TEXT,
+          egress_ip TEXT,
+          last_checked_at INTEGER,
           created_at INTEGER NOT NULL
         );
 
@@ -105,6 +108,15 @@ def init_db() -> None:
         conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('listen_port','443')")
         conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('fake_tls_domain','vk.com')")
         conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('public_host',?)", (PUBLIC_IP,))
+
+        for ddl in (
+            "ALTER TABLE routes ADD COLUMN egress_ip TEXT",
+            "ALTER TABLE routes ADD COLUMN last_checked_at INTEGER",
+        ):
+            try:
+                conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
 
 
 @app.on_event("startup")
@@ -350,6 +362,108 @@ def docker_down() -> tuple[bool, str]:
     return r.returncode == 0, (r.stdout + r.stderr)[-5000:]
 
 
+
+def route_outbound(route: sqlite3.Row) -> dict[str, Any]:
+    if route["kind"] == "vless":
+        return parse_vless(route["raw_config"])
+    if route["kind"] in {"socks", "http"}:
+        return parse_proxy(route["kind"], route["raw_config"])
+    raise ValueError("Unknown route kind")
+
+
+def build_checker_config(route: sqlite3.Row, listen_port: int) -> dict[str, Any]:
+    return {
+        "log": {"level": "warn"},
+        "inbounds": [
+            {
+                "type": "mixed",
+                "tag": "mixed-in",
+                "listen": "127.0.0.1",
+                "listen_port": listen_port,
+            }
+        ],
+        "outbounds": [
+            route_outbound(route),
+            {"type": "direct", "tag": "direct"},
+            {"type": "block", "tag": "block"},
+        ],
+        "route": {"final": "cascade"},
+    }
+
+
+def curl_via_checker(port: int, url: str, head: bool = False, timeout: int = 20) -> subprocess.CompletedProcess[str]:
+    cmd = [
+        "curl",
+        "-fsS",
+        "--max-time",
+        str(timeout),
+        "--connect-timeout",
+        "8",
+        "--socks5-hostname",
+        f"127.0.0.1:{port}",
+    ]
+    if head:
+        cmd.append("-I")
+    cmd.append(url)
+    return run(cmd, timeout=timeout + 5)
+
+
+def check_route_by_id(route_id: int) -> tuple[bool, str, str | None]:
+    with get_db() as conn:
+        route = conn.execute("SELECT * FROM routes WHERE id=?", (route_id,)).fetchone()
+
+    if not route:
+        return False, "route not found", None
+
+    listen_port = random.randint(21000, 45000)
+    checker_name = f"telemt-route-check-{route_id}-{secrets.token_hex(3)}"
+    checker_path = RUNTIME_DIR / f"{checker_name}.json"
+
+    try:
+        checker_path.write_text(
+            json.dumps(build_checker_config(route, listen_port), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        started = run(
+            [
+                "docker", "run", "-d", "--rm",
+                "--name", checker_name,
+                "--network", "host",
+                "-v", f"{checker_path}:/etc/sing-box/config.json:ro",
+                SING_BOX_IMAGE,
+                "run", "-c", "/etc/sing-box/config.json",
+            ],
+            timeout=60,
+        )
+        if started.returncode != 0:
+            return False, started.stderr[-1800:] or started.stdout[-1800:] or "failed to start sing-box checker", None
+
+        time.sleep(2.5)
+
+        ip_res = curl_via_checker(listen_port, "https://api.ipify.org", timeout=20)
+        if ip_res.returncode != 0:
+            logs = run(["docker", "logs", checker_name], timeout=20)
+            return False, (ip_res.stderr + logs.stderr + logs.stdout)[-2200:] or "failed to get egress IP through route", None
+
+        egress_ip = ip_res.stdout.strip()
+
+        tg_res = curl_via_checker(listen_port, "https://api.telegram.org", head=True, timeout=20)
+        if tg_res.returncode != 0:
+            logs = run(["docker", "logs", checker_name], timeout=20)
+            return False, f"egress_ip={egress_ip}; Telegram endpoint check failed: {(tg_res.stderr + logs.stderr + logs.stdout)[-1800:]}", egress_ip
+
+        return True, f"egress_ip={egress_ip}; Telegram HTTPS endpoint reachable through this route", egress_ip
+    except Exception as exc:
+        return False, str(exc), None
+    finally:
+        run(["docker", "rm", "-f", checker_name], timeout=30)
+        try:
+            checker_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def check_runtime() -> tuple[bool, str]:
     ps = run(["docker", "ps", "--filter", "name=telemt-cascade", "--format", "{{.Names}} {{.Status}}"], timeout=20)
     if "telemt-cascade-egress" not in ps.stdout:
@@ -358,10 +472,24 @@ def check_runtime() -> tuple[bool, str]:
         return False, "telemt container is not running"
 
     logs = run(["docker", "logs", "--tail", "160", "telemt-cascade"], timeout=20)
-    text = (logs.stdout + logs.stderr).lower()
-    if "panic" in text:
+    log_text = (logs.stdout + logs.stderr).lower()
+    if "panic" in log_text:
         return False, (logs.stdout + logs.stderr)[-1500:]
-    return True, "containers are running; verify final MTProto link inside Telegram client"
+
+    with get_db() as conn:
+        active = conn.execute("SELECT id FROM routes WHERE is_active=1 LIMIT 1").fetchone()
+
+    if not active:
+        return False, "cascade route is not selected; add and activate VLESS/SOCKS/HTTP route first"
+
+    ok, msg, egress_ip = check_route_by_id(int(active["id"]))
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE routes SET last_status=?, last_error=?, egress_ip=?, last_checked_at=? WHERE id=?",
+            ("ok" if ok else "error", None if ok else msg, egress_ip, int(time.time()), int(active["id"])),
+        )
+
+    return ok, msg
 
 
 def html_page(body: str) -> HTMLResponse:
@@ -381,7 +509,7 @@ button{{background:#5d7cff;color:white;border:0;border-radius:10px;padding:10px 
 table{{width:100%;border-collapse:collapse}} td,th{{border-bottom:1px solid #263153;padding:8px;text-align:left;vertical-align:top}}
 code{{word-break:break-all}}
 </style></head><body><main>
-<h1>TeleMT Cascade Test Panel</h1>
+<h1>TeleMT Cascade Test Panel v0.2</h1>
 {body}
 </main></body></html>
 """)
@@ -400,9 +528,11 @@ def index(_: str = Depends(require_auth)) -> HTMLResponse:
     routes_rows = "".join(
         f"<tr><td>{r['id']}</td><td>{r['name']}</td><td>{r['kind']}</td>"
         f"<td>{'<span class=badge>active</span>' if r['is_active'] else ''}{r['last_status']}</td>"
-        f"<td><form method=post action=/routes/{r['id']}/activate><button>Активировать</button></form></td></tr>"
+        f"<td><code>{r['egress_ip'] or '-'}</code></td>"
+        f"<td><form method=post action=/routes/{r['id']}/activate style='display:inline'><button>Активировать</button></form>"
+        f"<form method=post action=/routes/{r['id']}/check style='display:inline'><button>Чек route</button></form></td></tr>"
         for r in routes
-    ) or "<tr><td colspan=5 class=muted>Маршрутов пока нет</td></tr>"
+    ) or "<tr><td colspan=6 class=muted>Маршрутов пока нет</td></tr>"
 
     key_rows = "".join(
         f"<tr><td>{k['name']}</td><td><code>{mtproto_link(k['secret'])}</code></td><td>{'enabled' if k['enabled'] else 'disabled'}</td></tr>"
@@ -453,7 +583,7 @@ def index(_: str = Depends(require_auth)) -> HTMLResponse:
 
 <div class="card">
 <h2>Маршруты</h2>
-<table><tr><th>ID</th><th>Название</th><th>Тип</th><th>Статус</th><th></th></tr>{routes_rows}</table>
+<table><tr><th>ID</th><th>Название</th><th>Тип</th><th>Статус</th><th>Egress IP</th><th></th></tr>{routes_rows}</table>
 </div>
 
 <div class="card">
@@ -506,6 +636,18 @@ def add_proxy_route(
     return RedirectResponse("/", status_code=303)
 
 
+
+@app.post("/routes/{route_id}/check")
+def check_route(route_id: int, _: str = Depends(require_auth)):
+    ok, msg, egress_ip = check_route_by_id(route_id)
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE routes SET last_status=?, last_error=?, egress_ip=?, last_checked_at=? WHERE id=?",
+            ("ok" if ok else "error", None if ok else msg, egress_ip, int(time.time()), route_id),
+        )
+    return PlainTextResponse(("OK: " if ok else "ERROR: ") + msg)
+
+
 @app.post("/routes/{route_id}/activate")
 def activate_route(route_id: int, _: str = Depends(require_auth)):
     with get_db() as conn:
@@ -540,15 +682,13 @@ def stop(_: str = Depends(require_auth)):
 @app.post("/check")
 def check(_: str = Depends(require_auth)):
     ok, msg = check_runtime()
-    with get_db() as conn:
-        conn.execute("UPDATE routes SET last_status=?, last_error=? WHERE is_active=1", ("ok" if ok else "error", None if ok else msg))
     return PlainTextResponse(("OK: " if ok else "ERROR: ") + msg)
 
 
 @app.get("/api/status")
 def api_status(_: str = Depends(require_auth)):
     with get_db() as conn:
-        active = conn.execute("SELECT id,name,kind,last_status,last_error FROM routes WHERE is_active=1").fetchone()
+        active = conn.execute("SELECT id,name,kind,last_status,last_error,egress_ip,last_checked_at FROM routes WHERE is_active=1").fetchone()
         keys = conn.execute("SELECT name,secret,enabled FROM access_keys ORDER BY id").fetchall()
 
     ps = run(["docker", "ps", "--filter", "name=telemt-cascade", "--format", "{{.Names}} {{.Status}}"], timeout=20)
@@ -619,7 +759,7 @@ ufw allow 443/tcp >/dev/null 2>&1 || true
 
 echo
 echo "============================================================"
-echo " TeleMT Cascade Test Panel installed"
+echo " TeleMT Cascade Test Panel v0.2 installed"
 echo "============================================================"
 echo " Panel:    http://${PUBLIC_IP}:${APP_PORT}"
 echo " Login:    admin"
