@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="0.1.1"
+APP_VERSION="0.1.2"
 APP_NAME="telemt-xray-doublehop-panel"
 APP_DIR="/opt/telemt-doublehop-panel"
 APP_ETC="/etc/telemt-panel"
@@ -38,69 +38,69 @@ usage() {
   cat <<USAGE
 ${APP_NAME} v${APP_VERSION}
 
-Usage:
-  # Interactive wizard, recommended for GitHub/process-substitution installs:
+Использование:
+  # Интерактивная установка, удобно для запуска с GitHub:
   sudo bash $0
 
-  # Non-interactive mode:
+  # Нейнтерактивный режим:
   sudo bash $0 --role egress --edge-host EDGE_PUBLIC_IP_OR_DOMAIN [options]
   sudo bash $0 --role edge --egress-host EGRESS_PUBLIC_IP_OR_DOMAIN --uuid UUID --reality-public-key KEY --short-id HEX [options]
   sudo bash $0 --role single --edge-host THIS_PUBLIC_IP_OR_DOMAIN [options]
 
-Roles:
-  egress  Xray REALITY server + Telemt + web panel. Telemt listens only on localhost.
-  edge    HAProxy public :443 + Xray client local forward to egress Telemt.
-  single  Direct Telemt + web panel without Xray/HAProxy. Telemt listens on public :443.
+Роли:
+  egress  Выходной VPS: Xray REALITY server + Telemt + веб-панель. Telemt слушает только localhost.
+  edge    Входной VPS: HAProxy public :443 + Xray client, который ведёт на egress Telemt.
+  single  Один VPS без double-hop: Telemt + веб-панель, Telemt слушает публичный :443.
 
-Important options:
-  --edge-host VALUE              Public host users put into Telegram proxy links.
-  --egress-host VALUE            Public host of egress Xray server for edge role.
-  --edge-port PORT               Public MTProxy port on edge/single. Default: 443.
-  --xray-port PORT               Xray REALITY server port on egress. Default: 443.
-  --telemt-sni DOMAIN            FakeTLS SNI inside MTProxy secret. Default: vk.com.
-  --reality-sni DOMAIN           REALITY serverName for edge->egress tunnel. Default: www.microsoft.com.
-  --reality-dest HOST:PORT       REALITY dest. Default: <reality-sni>:443.
-  --uuid UUID                    VLESS user UUID. Auto-generated on egress/single if omitted.
-  --reality-private-key KEY      Xray REALITY private key. Auto-generated on egress if omitted.
-  --reality-public-key KEY       Xray REALITY public key. Required on edge.
-  --short-id HEX                 Xray REALITY shortId. Auto-generated on egress if omitted.
-  --panel-bind IP                Web panel bind address. Default: 127.0.0.1.
-  --panel-port PORT              Web panel port. Default: 9444.
-  --panel-password PASSWORD      Web panel password. Auto-generated if omitted.
-  --no-firewall                  Do not touch ufw/firewalld.
+Важные параметры:
+  --edge-host VALUE              Публичный host/IP, который будет в Telegram proxy-ссылках.
+  --egress-host VALUE            Публичный host/IP egress-сервера с Xray REALITY.
+  --edge-port PORT               Публичный MTProxy-порт на edge/single. По умолчанию: 443.
+  --xray-port PORT               Порт Xray REALITY server на egress. По умолчанию: 443.
+  --telemt-sni DOMAIN            FakeTLS SNI внутри MTProxy secret. По умолчанию: vk.com.
+  --reality-sni DOMAIN           REALITY serverName для туннеля edge -> egress. По умолчанию: www.microsoft.com.
+  --reality-dest HOST:PORT       REALITY dest. По умолчанию: <reality-sni>:443.
+  --uuid UUID                    UUID пользователя VLESS. На egress/single генерируется автоматически.
+  --reality-private-key KEY      Приватный ключ Xray REALITY. На egress генерируется автоматически.
+  --reality-public-key KEY       Публичный ключ Xray REALITY. Обязателен на edge.
+  --short-id HEX                 REALITY shortId. На egress генерируется автоматически.
+  --panel-bind IP                IP, на котором слушает веб-панель. По умолчанию: 127.0.0.1.
+  --panel-port PORT              Порт веб-панели. По умолчанию: 9444.
+  --panel-password PASSWORD      Пароль веб-панели. Генерируется автоматически, если не указан.
+  --no-firewall                  Не менять ufw/firewalld.
 
-GitHub launch examples:
-  # Interactive wizard:
-  sudo bash <(curl -fsSL 'https://raw.githubusercontent.com/USER/REPO/BRANCH/telemt-xray-doublehop-panel-v0.1.1.sh')
+Примеры запуска с GitHub:
+  # Интерактивная установка:
+  sudo bash <(curl -fsSL 'https://raw.githubusercontent.com/USER/REPO/BRANCH/telemt-xray-doublehop-panel-v0.1.2.sh')
 
-  # Egress VPS outside Russia:
-  sudo bash <(curl -fsSL 'https://raw.githubusercontent.com/USER/REPO/BRANCH/telemt-xray-doublehop-panel-v0.1.1.sh') --role egress --edge-host edge.example.com --egress-host egress.example.com
+  # Egress VPS вне РФ:
+  sudo bash <(curl -fsSL 'https://raw.githubusercontent.com/USER/REPO/BRANCH/telemt-xray-doublehop-panel-v0.1.2.sh') --role egress --edge-host edge.example.com --egress-host egress.example.com
 
-  # Pipe mode; arguments after "bash -s --" are passed to this installer:
-  curl -fsSL 'https://raw.githubusercontent.com/USER/REPO/BRANCH/telemt-xray-doublehop-panel-v0.1.1.sh' | sudo bash -s -- --role egress --edge-host edge.example.com --egress-host egress.example.com
+  # Pipe-режим; всё после "bash -s --" передаётся в installer:
+  curl -fsSL 'https://raw.githubusercontent.com/USER/REPO/BRANCH/telemt-xray-doublehop-panel-v0.1.2.sh' | sudo bash -s -- --role egress --edge-host edge.example.com --egress-host egress.example.com
 
-  # Edge VPS reachable from Russia, using values printed by egress install:
-  sudo bash <(curl -fsSL 'https://raw.githubusercontent.com/USER/REPO/BRANCH/telemt-xray-doublehop-panel-v0.1.1.sh') --role edge --egress-host egress.example.com --uuid <uuid> --reality-public-key <key> --short-id <hex>
+  # Edge VPS, доступный пользователям из РФ. Используй значения, которые напечатал egress-installer:
+  sudo bash <(curl -fsSL 'https://raw.githubusercontent.com/USER/REPO/BRANCH/telemt-xray-doublehop-panel-v0.1.2.sh') --role edge --egress-host egress.example.com --uuid <uuid> --reality-public-key <key> --short-id <hex>
 
-  # Open local panel through SSH tunnel:
+  # Открыть локальную панель через SSH-туннель:
   ssh -L 9444:127.0.0.1:9444 root@EGRESS_PUBLIC_IP
-  then open http://127.0.0.1:9444/
+  затем открой http://127.0.0.1:9444/
 USAGE
 }
 
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE"; }
-warn() { printf '[%s] WARN: %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE" >&2; }
-fatal() { printf '[%s] ERROR: %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE" >&2; exit 1; }
+warn() { printf '[%s] ПРЕДУПРЕЖДЕНИЕ: %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE" >&2; }
+fatal() { printf '[%s] ОШИБКА: %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE" >&2; exit 1; }
 
 on_error() {
   local exit_code=$?
-  warn "Installer failed with exit code ${exit_code}. See ${LOG_FILE}."
+  warn "Установка завершилась с ошибкой, код ${exit_code}. Подробности смотри в ${LOG_FILE}."
   exit "$exit_code"
 }
 trap on_error ERR
 
 require_root() {
-  [[ "${EUID}" -eq 0 ]] || fatal "Run as root: sudo bash $0 ..."
+  [[ "${EUID}" -eq 0 ]] || fatal "Запусти от root: sudo bash $0 ..."
 }
 
 has_tty() {
@@ -127,84 +127,84 @@ prompt_required() {
       printf -v "$__var" '%s' "$value"
       return 0
     fi
-    printf 'Value is required.\n' > /dev/tty
+    printf 'Значение обязательно.\n' > /dev/tty
   done
 }
 
 interactive_setup() {
   if ! has_tty; then
     usage
-    fatal "No arguments were passed and no interactive TTY is available. Use: curl -fsSL URL | sudo bash -s -- --role egress --edge-host EDGE --egress-host EGRESS"
+    fatal "Аргументы не переданы и интерактивный терминал недоступен. Используй: curl -fsSL URL | sudo bash -s -- --role egress --edge-host EDGE --egress-host EGRESS"
   fi
 
   usage
   echo
-  echo "No arguments were passed, starting interactive setup wizard." > /dev/tty
-  echo "For GitHub installs this is intentional: sudo bash <(curl -fsSL URL)" > /dev/tty
+  echo "Аргументы не переданы, запускаю интерактивную установку." > /dev/tty
+  echo "Для установки с GitHub это нормальный режим: sudo bash <(curl -fsSL URL)" > /dev/tty
   echo > /dev/tty
 
   while true; do
-    prompt_value ROLE "Role: egress, edge or single" "egress"
+    prompt_value ROLE "Роль сервера: egress, edge или single" "egress"
     [[ "$ROLE" =~ ^(egress|edge|single)$ ]] && break
-    echo "Role must be one of: egress, edge, single" > /dev/tty
+    echo "Роль должна быть одной из: egress, edge, single" > /dev/tty
   done
 
   case "$ROLE" in
     egress)
-      prompt_required EDGE_HOST "Public EDGE host/IP that Telegram users will use"
-      prompt_value EGRESS_HOST "Public EGRESS host/IP for the generated edge install command" ""
-      prompt_value EDGE_PORT "Public MTProxy port on edge" "$EDGE_PORT"
-      prompt_value XRAY_PORT "Xray REALITY port on egress" "$XRAY_PORT"
+      prompt_required EDGE_HOST "Публичный host/IP EDGE-сервера, который будут использовать пользователи Telegram"
+      prompt_value EGRESS_HOST "Публичный host/IP EGRESS-сервера для готовой команды установки edge" ""
+      prompt_value EDGE_PORT "Публичный MTProxy-порт на edge" "$EDGE_PORT"
+      prompt_value XRAY_PORT "Порт Xray REALITY на egress" "$XRAY_PORT"
       prompt_value TELEMT_SNI "Telemt FakeTLS SNI" "$TELEMT_SNI"
       prompt_value REALITY_SNI "Xray REALITY SNI" "$REALITY_SNI"
       ;;
     edge)
-      prompt_required EGRESS_HOST "Public EGRESS host/IP where Xray REALITY server runs"
-      prompt_value EDGE_HOST "This EDGE public host/IP, optional" ""
-      prompt_required UUID "VLESS UUID printed by egress install"
-      prompt_required REALITY_PUBLIC_KEY "REALITY public key printed by egress install"
-      prompt_required REALITY_SHORT_ID "REALITY shortId printed by egress install"
-      prompt_value EDGE_PORT "Public MTProxy port on this edge" "$EDGE_PORT"
-      prompt_value XRAY_PORT "Xray REALITY port on egress" "$XRAY_PORT"
-      prompt_value TELEMT_LOCAL_PORT "Telemt local port on egress" "$TELEMT_LOCAL_PORT"
+      prompt_required EGRESS_HOST "Публичный host/IP EGRESS-сервера, где запущен Xray REALITY"
+      prompt_value EDGE_HOST "Публичный host/IP этого EDGE-сервера, можно оставить пустым" ""
+      prompt_required UUID "VLESS UUID, который напечатала установка egress"
+      prompt_required REALITY_PUBLIC_KEY "Публичный ключ REALITY, который напечатала установка egress"
+      prompt_required REALITY_SHORT_ID "REALITY shortId, который напечатала установка egress"
+      prompt_value EDGE_PORT "Публичный MTProxy-порт на этом edge" "$EDGE_PORT"
+      prompt_value XRAY_PORT "Порт Xray REALITY на egress" "$XRAY_PORT"
+      prompt_value TELEMT_LOCAL_PORT "Локальный порт Telemt на egress" "$TELEMT_LOCAL_PORT"
       prompt_value REALITY_SNI "Xray REALITY SNI" "$REALITY_SNI"
       ;;
     single)
-      prompt_required EDGE_HOST "This server public host/IP for Telegram proxy links"
-      prompt_value EDGE_PORT "Public MTProxy port on this server" "$EDGE_PORT"
+      prompt_required EDGE_HOST "Публичный host/IP этого сервера для Telegram proxy-ссылок"
+      prompt_value EDGE_PORT "Публичный MTProxy-порт на этом сервере" "$EDGE_PORT"
       prompt_value TELEMT_SNI "Telemt FakeTLS SNI" "$TELEMT_SNI"
       ;;
   esac
 
-  prompt_value PANEL_BIND "Web panel bind address" "$PANEL_BIND"
-  prompt_value PANEL_PORT "Web panel port" "$PANEL_PORT"
+  prompt_value PANEL_BIND "IP-адрес, на котором будет слушать веб-панель" "$PANEL_BIND"
+  prompt_value PANEL_PORT "Порт веб-панели" "$PANEL_PORT"
 }
 
 validate_args() {
   if [[ -z "$ROLE" ]]; then
     usage
-    fatal "--role was not received by the installer. With bash <(curl ...), put options AFTER the closing ')', for example: sudo bash <(curl -fsSL URL) --role egress --edge-host edge.example.com --egress-host egress.example.com"
+    fatal "--role не дошёл до installer. При запуске bash <(curl ...) ставь параметры ПОСЛЕ закрывающей скобки ')', например: sudo bash <(curl -fsSL URL) --role egress --edge-host edge.example.com --egress-host egress.example.com"
   fi
 
-  [[ "$ROLE" =~ ^(egress|edge|single)$ ]] || fatal "--role must be egress, edge or single"
-  [[ "$EDGE_PORT" =~ ^[0-9]+$ ]] || fatal "--edge-port must be numeric"
-  [[ "$XRAY_PORT" =~ ^[0-9]+$ ]] || fatal "--xray-port must be numeric"
-  [[ "$XRAY_LOCAL_PORT" =~ ^[0-9]+$ ]] || fatal "--xray-local-port must be numeric"
-  [[ "$TELEMT_LOCAL_PORT" =~ ^[0-9]+$ ]] || fatal "--telemt-local-port must be numeric"
-  [[ "$PANEL_PORT" =~ ^[0-9]+$ ]] || fatal "--panel-port must be numeric"
+  [[ "$ROLE" =~ ^(egress|edge|single)$ ]] || fatal "--role должен быть egress, edge или single"
+  [[ "$EDGE_PORT" =~ ^[0-9]+$ ]] || fatal "--edge-port должен быть числом"
+  [[ "$XRAY_PORT" =~ ^[0-9]+$ ]] || fatal "--xray-port должен быть числом"
+  [[ "$XRAY_LOCAL_PORT" =~ ^[0-9]+$ ]] || fatal "--xray-local-port должен быть числом"
+  [[ "$TELEMT_LOCAL_PORT" =~ ^[0-9]+$ ]] || fatal "--telemt-local-port должен быть числом"
+  [[ "$PANEL_PORT" =~ ^[0-9]+$ ]] || fatal "--panel-port должен быть числом"
 
   for port_value in "$EDGE_PORT" "$XRAY_PORT" "$XRAY_LOCAL_PORT" "$TELEMT_LOCAL_PORT" "$PANEL_PORT"; do
-    (( port_value >= 1 && port_value <= 65535 )) || fatal "Port out of range: ${port_value}"
+    (( port_value >= 1 && port_value <= 65535 )) || fatal "Порт вне допустимого диапазона: ${port_value}"
   done
 
   if [[ "$ROLE" == "egress" || "$ROLE" == "single" ]]; then
-    [[ -n "$EDGE_HOST" ]] || fatal "--edge-host is required for role ${ROLE}"
+    [[ -n "$EDGE_HOST" ]] || fatal "Для роли ${ROLE} обязателен --edge-host"
   fi
   if [[ "$ROLE" == "edge" ]]; then
-    [[ -n "$EGRESS_HOST" ]] || fatal "--egress-host is required for edge role"
-    [[ -n "$UUID" ]] || fatal "--uuid is required for edge role"
-    [[ -n "$REALITY_PUBLIC_KEY" ]] || fatal "--reality-public-key is required for edge role"
-    [[ -n "$REALITY_SHORT_ID" ]] || fatal "--short-id is required for edge role"
+    [[ -n "$EGRESS_HOST" ]] || fatal "Для роли edge обязателен --egress-host"
+    [[ -n "$UUID" ]] || fatal "Для роли edge обязателен --uuid"
+    [[ -n "$REALITY_PUBLIC_KEY" ]] || fatal "Для роли edge обязателен --reality-public-key"
+    [[ -n "$REALITY_SHORT_ID" ]] || fatal "Для роли edge обязателен --short-id"
   fi
   if [[ -z "$REALITY_DEST" ]]; then
     REALITY_DEST="${REALITY_SNI}:443"
@@ -240,7 +240,7 @@ parse_args() {
       --default-user) DEFAULT_USER="${2:-}"; shift 2 ;;
       --no-firewall) NO_FIREWALL="1"; shift ;;
       -h|--help) usage; exit 0 ;;
-      *) fatal "Unknown argument: $1" ;;
+      *) fatal "Неизвестный аргумент: $1" ;;
     esac
   done
 
@@ -249,7 +249,7 @@ parse_args() {
 
 apt_install() {
   export DEBIAN_FRONTEND=noninteractive
-  log "Installing required OS packages"
+  log "Устанавливаю необходимые системные пакеты"
   apt-get update -y
   apt-get install -y --no-install-recommends \
     ca-certificates curl wget jq openssl tar gzip unzip coreutils \
@@ -258,8 +258,8 @@ apt_install() {
 }
 
 ensure_systemd() {
-  command -v systemctl >/dev/null 2>&1 || fatal "systemd is required"
-  [[ -d /run/systemd/system ]] || fatal "systemd does not look active on this host"
+  command -v systemctl >/dev/null 2>&1 || fatal "Для установки нужен systemd"
+  [[ -d /run/systemd/system ]] || fatal "Похоже, systemd не активен на этом сервере"
 }
 
 random_hex() { openssl rand -hex "$1"; }
@@ -276,7 +276,7 @@ ensure_uuid() {
 }
 
 configure_sysctl() {
-  log "Applying safe network sysctl defaults"
+  log "Применяю безопасные сетевые sysctl-настройки"
   cat >/etc/sysctl.d/99-telemt-doublehop.conf <<'EOF'
 net.core.somaxconn = 65535
 net.ipv4.tcp_fastopen = 3
@@ -284,7 +284,7 @@ net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.ip_local_port_range = 10240 65535
 EOF
-  sysctl --system >/dev/null || warn "sysctl apply failed; continuing"
+  sysctl --system >/dev/null || warn "Не удалось применить sysctl, продолжаю установку"
 }
 
 configure_firewall() {
@@ -310,10 +310,10 @@ configure_firewall() {
 
 install_xray() {
   if command -v /usr/local/bin/xray >/dev/null 2>&1; then
-    log "Xray already installed: $(/usr/local/bin/xray version | head -n1 || true)"
+    log "Xray уже установлен: $(/usr/local/bin/xray version | head -n1 || true)"
     return 0
   fi
-  log "Installing Xray via official XTLS installer"
+  log "Устанавливаю Xray через официальный installer XTLS"
   bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
 }
 
@@ -322,22 +322,22 @@ generate_reality_keys_if_needed() {
   if [[ -n "$REALITY_PRIVATE_KEY" && -n "$REALITY_PUBLIC_KEY" ]]; then
     return 0
   fi
-  log "Generating Xray REALITY x25519 key pair"
+  log "Генерирую пару ключей Xray REALITY x25519"
   local out
   out="$(/usr/local/bin/xray x25519)"
   REALITY_PRIVATE_KEY="$(awk -F': ' '/Private key/{print $2}' <<<"$out" | tr -d '[:space:]')"
   REALITY_PUBLIC_KEY="$(awk -F': ' '/Public key/{print $2}' <<<"$out" | tr -d '[:space:]')"
-  [[ -n "$REALITY_PRIVATE_KEY" && -n "$REALITY_PUBLIC_KEY" ]] || fatal "Could not generate REALITY keys"
+  [[ -n "$REALITY_PRIVATE_KEY" && -n "$REALITY_PUBLIC_KEY" ]] || fatal "Не удалось сгенерировать REALITY-ключи"
   [[ -n "$REALITY_SHORT_ID" ]] || REALITY_SHORT_ID="$(random_hex 8)"
 }
 
 install_telemt() {
   if [[ -x "$TELEMT_BIN" ]]; then
-    log "Telemt already installed: $($TELEMT_BIN --version 2>/dev/null || echo unknown)"
+    log "Telemt уже установлен: $($TELEMT_BIN --version 2>/dev/null || echo unknown)"
     return 0
   fi
 
-  log "Installing latest Telemt release"
+  log "Устанавливаю последний релиз Telemt"
   local arch libc tmp
   arch="$(uname -m)"
   libc="gnu"
@@ -367,15 +367,15 @@ write_telemt_config() {
     listen_addr="0.0.0.0"
     listen_port="${EDGE_PORT}"
     proxy_protocol="false"
-    architecture_comment="Architecture: Telegram client -> this VPS:${EDGE_PORT} -> Telemt -> Telegram"
+    architecture_comment="Архитектура: Telegram client -> этот VPS:${EDGE_PORT} -> Telemt -> Telegram"
   else
     listen_addr="127.0.0.1"
     listen_port="${TELEMT_LOCAL_PORT}"
     proxy_protocol="true"
-    architecture_comment="Architecture: Telegram client -> edge:${EDGE_PORT} -> HAProxy PROXYv2 -> Xray tunnel -> egress Telemt:${TELEMT_LOCAL_PORT} -> Telegram"
+    architecture_comment="Архитектура: Telegram client -> edge:${EDGE_PORT} -> HAProxy PROXYv2 -> Xray tunnel -> egress Telemt:${TELEMT_LOCAL_PORT} -> Telegram"
   fi
 
-  log "Writing Telemt config: ${TELEMT_CONFIG}"
+  log "Записываю конфиг Telemt: ${TELEMT_CONFIG}"
   mkdir -p /etc/telemt
   cat >"$TELEMT_CONFIG" <<EOF
 # Managed by ${APP_NAME} v${APP_VERSION}
@@ -417,7 +417,7 @@ EOF
 }
 
 write_telemt_service() {
-  log "Writing telemt systemd unit"
+  log "Создаю systemd-unit для telemt"
   cat >/etc/systemd/system/telemt.service <<EOF
 [Unit]
 Description=Telemt MTProxy
@@ -444,7 +444,7 @@ EOF
 }
 
 write_xray_egress_config() {
-  log "Writing Xray egress REALITY server config"
+  log "Создаю конфиг Xray egress REALITY server"
   mkdir -p /usr/local/etc/xray
   cat >"$XRAY_CONFIG" <<EOF
 {
@@ -514,7 +514,7 @@ EOF
 }
 
 write_xray_edge_config() {
-  log "Writing Xray edge client forward config"
+  log "Создаю конфиг Xray edge client forward"
   mkdir -p /usr/local/etc/xray
   cat >"$XRAY_CONFIG" <<EOF
 {
@@ -576,7 +576,7 @@ EOF
 }
 
 write_haproxy_config() {
-  log "Writing HAProxy edge config"
+  log "Создаю конфиг HAProxy для edge"
   cat >"$HAPROXY_CONFIG" <<EOF
 global
     log /dev/log local0
@@ -640,7 +640,7 @@ EOF
 }
 
 write_panel_app() {
-  log "Writing web panel application"
+  log "Записываю приложение веб-панели"
   mkdir -p "$APP_DIR"
   cat >"$APP_DIR/server.py" <<'PY_EOF'
 #!/usr/bin/env python3
@@ -1074,31 +1074,31 @@ class Handler(BaseHTTPRequestHandler):
     def render_dashboard(self) -> None:
         services = [service_status(name) for name in ("telemt", "xray", "haproxy", "telemt-panel")]
         users = list_config_users()
-        links = get_links_payload() if ROLE in {"egress", "single"} else {"note": "links are generated on egress role"}
+        links = get_links_payload() if ROLE in {"egress", "single"} else {"note": "ссылки генерируются на роли egress"}
         health_status, health_body = http_get_local(f"{TELEMT_API}/v1/health/ready") if ROLE in {"egress", "single"} else (0, "edge role")
 
         service_rows = "".join(
             f"<tr><td>{esc(s['name'])}</td><td class='{ 'ok' if s['active'] == 'active' else 'bad' }'>{esc(s['active'])}</td><td>{esc(s['enabled'])}</td>"
-            f"<td><form class='inline' method='post' action='/service/restart'><input type='hidden' name='service' value='{esc(s['name'])}'><button class='secondary' type='submit'>restart</button></form></td></tr>"
+            f"<td><form class='inline' method='post' action='/service/restart'><input type='hidden' name='service' value='{esc(s['name'])}'><button class='secondary' type='submit'>перезапустить</button></form></td></tr>"
             for s in services
         )
         user_rows = "".join(
             f"<tr><td><code>{esc(u.name)}</code></td><td><code>{esc(u.secret)}</code></td><td>"
-            f"<form class='inline' method='post' action='/users/delete' onsubmit=\"return confirm('Delete user {esc(u.name)}?')\"><input type='hidden' name='name' value='{esc(u.name)}'><button class='danger' type='submit'>delete</button></form>"
+            f"<form class='inline' method='post' action='/users/delete' onsubmit=\"return confirm('Удалить пользователя {esc(u.name)}?')\"><input type='hidden' name='name' value='{esc(u.name)}'><button class='danger' type='submit'>удалить</button></form>"
             f"</td></tr>" for u in users
         ) or "<tr><td colspan='3' class='muted'>Нет пользователей в telemt.toml</td></tr>"
 
         body = f"""
-<div class="topbar"><div><h1>Telemt + Xray Double Hop</h1><div class="sub">role: <code>{esc(ROLE)}</code> · version: <code>{esc(APP_VERSION)}</code></div></div><a class="btn" href="/logout">Выйти</a></div>
+<div class="topbar"><div><h1>Telemt + Xray Double Hop</h1><div class="sub">роль: <code>{esc(ROLE)}</code> · версия: <code>{esc(APP_VERSION)}</code></div></div><a class="btn" href="/logout">Выйти</a></div>
 <div class="notice">Панель по умолчанию рассчитана на доступ через SSH tunnel. Не публикуй её в Интернет без firewall/VPN.</div>
 <div class="grid" style="margin-top:16px">
   <section class="card">
     <h2>Архитектура</h2>
-    <div class="row"><span class="muted">MTProxy public host</span><span><code>{esc(EDGE_HOST or 'set on egress')}</code>:{esc(EDGE_PORT)}</span></div>
+    <div class="row"><span class="muted">Публичный MTProxy host</span><span><code>{esc(EDGE_HOST or 'set on egress')}</code>:{esc(EDGE_PORT)}</span></div>
     <div class="row"><span class="muted">Telemt FakeTLS SNI</span><span><code>{esc(TELEMT_SNI)}</code></span></div>
     <div class="row"><span class="muted">Egress host</span><span><code>{esc(EGRESS_HOST or 'this host / n/a')}</code>:{esc(XRAY_PORT)}</span></div>
     <div class="row"><span class="muted">Xray REALITY SNI</span><span><code>{esc(REALITY_SNI)}</code></span></div>
-    <div class="row"><span class="muted">Telemt readiness</span><span class="{ 'ok' if health_status == 200 else 'warn' }">HTTP {esc(health_status)}</span></div>
+    <div class="row"><span class="muted">Готовность Telemt</span><span class="{ 'ok' if health_status == 200 else 'warn' }">HTTP {esc(health_status)}</span></div>
   </section>
   <section class="card">
     <h2>Public host для ссылок</h2>
@@ -1112,7 +1112,7 @@ class Handler(BaseHTTPRequestHandler):
 
 <section class="card" style="margin-top:16px">
   <h2>Сервисы</h2>
-  <table class="table"><thead><tr><th>service</th><th>active</th><th>enabled</th><th></th></tr></thead><tbody>{service_rows}</tbody></table>
+  <table class="table"><thead><tr><th>сервис</th><th>статус</th><th>автозапуск</th><th></th></tr></thead><tbody>{service_rows}</tbody></table>
 </section>
 
 <section class="card" style="margin-top:16px">
@@ -1169,9 +1169,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     if not PANEL_PASSWORD:
-        raise SystemExit("PANEL_PASSWORD is empty in /etc/telemt-panel/panel.env")
+        raise SystemExit("PANEL_PASSWORD пустой в /etc/telemt-panel/panel.env")
     server = ThreadingHTTPServer((PANEL_BIND, PANEL_PORT), Handler)
-    print(f"Telemt panel listening on http://{PANEL_BIND}:{PANEL_PORT}/ role={ROLE}", flush=True)
+    print(f"Панель Telemt слушает http://{PANEL_BIND}:{PANEL_PORT}/ роль={ROLE}", flush=True)
     server.serve_forever()
 
 
@@ -1182,7 +1182,7 @@ PY_EOF
 }
 
 write_panel_service() {
-  log "Writing panel systemd unit"
+  log "Создаю systemd-unit для веб-панели"
   cat >/etc/systemd/system/${PANEL_SERVICE} <<EOF
 [Unit]
 Description=Telemt Double Hop Web Panel
@@ -1208,7 +1208,7 @@ EOF
 }
 
 write_helper_cli() {
-  log "Writing helper CLI /usr/local/sbin/telemt-doublehop"
+  log "Создаю helper CLI /usr/local/sbin/telemt-doublehop"
   cat >/usr/local/sbin/telemt-doublehop <<'CLI_EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -1262,7 +1262,7 @@ PY
     systemctl restart telemt
     ;;
   *)
-    echo "Usage: telemt-doublehop {status|links|ready|logs [svc]|restart [svc]|set-edge-host HOST [PORT]}" >&2
+    echo "Использование: telemt-doublehop {status|links|ready|logs [service]|restart [service]|set-edge-host HOST [PORT]}" >&2
     exit 2
     ;;
 esac
@@ -1285,53 +1285,53 @@ start_services() {
 
 wait_for_port() {
   local host="$1" port="$2" label="$3" max="${4:-60}"
-  log "Waiting for ${label} at ${host}:${port}"
+  log "Жду запуск ${label} на ${host}:${port}"
   for _ in $(seq 1 "$max"); do
     if nc -z "$host" "$port" >/dev/null 2>&1; then
-      log "${label} is reachable"
+      log "${label} доступен"
       return 0
     fi
     sleep 1
   done
-  warn "${label} did not become reachable within ${max}s"
+  warn "${label} не стал доступен за ${max} сек."
   return 1
 }
 
 post_install_info() {
   echo
   echo "============================================================"
-  echo "${APP_NAME} v${APP_VERSION} installed"
-  echo "Role: ${ROLE}"
-  echo "Panel: http://${PANEL_BIND}:${PANEL_PORT}/"
-  echo "Panel password: ${PANEL_PASSWORD}"
+  echo "${APP_NAME} v${APP_VERSION} установлен"
+  echo "Роль: ${ROLE}"
+  echo "Веб-панель: http://${PANEL_BIND}:${PANEL_PORT}/"
+  echo "Пароль веб-панели: ${PANEL_PASSWORD}"
   echo "Helper CLI: telemt-doublehop {status|links|ready|logs|restart}"
-  echo "Install log: ${LOG_FILE}"
+  echo "Лог установки: ${LOG_FILE}"
 
   if [[ "$ROLE" == "egress" ]]; then
     echo
-    echo "Run this on EDGE server, replacing --egress-host if needed:"
+    echo "Выполни это на EDGE-сервере, при необходимости замени --egress-host:"
     echo "sudo bash ${APP_NAME}-v${APP_VERSION}.sh --role edge \\" 
     echo "  --egress-host ${EGRESS_HOST:-<EGRESS_PUBLIC_IP_OR_DOMAIN>} --xray-port ${XRAY_PORT} \\" 
     echo "  --uuid ${UUID} --reality-public-key ${REALITY_PUBLIC_KEY} --short-id ${REALITY_SHORT_ID} \\" 
     echo "  --reality-sni ${REALITY_SNI} --telemt-local-port ${TELEMT_LOCAL_PORT}"
     echo
-    echo "After edge is installed, open panel on egress and check / links."
+    echo "После установки edge открой панель на egress и проверь ссылки."
   fi
 
   if [[ "$ROLE" == "edge" ]]; then
     echo
-    echo "Edge public MTProxy endpoint: ${EDGE_HOST:-<this-edge-host>}:${EDGE_PORT}"
-    echo "Now go to the egress panel and ensure public_host points to this edge host."
+    echo "Публичная MTProxy-точка edge: ${EDGE_HOST:-<this-edge-host>}:${EDGE_PORT}"
+    echo "Теперь зайди в панель egress и убедись, что public_host указывает на этот edge-host."
   fi
 
   if [[ "$ROLE" == "single" ]]; then
     echo
-    echo "Single public MTProxy endpoint: ${EDGE_HOST}:${EDGE_PORT}"
+    echo "Публичная MTProxy-точка single: ${EDGE_HOST}:${EDGE_PORT}"
   fi
 
   if [[ "$ROLE" == "egress" || "$ROLE" == "single" ]]; then
     echo
-    echo "Current Telemt links from API:"
+    echo "Текущие Telemt-ссылки из API:"
     curl -fsS "http://${TELEMT_API_LISTEN}/v1/users" | jq . || true
   fi
   echo "============================================================"
@@ -1345,7 +1345,7 @@ main() {
   touch "$LOG_FILE"
   chmod 0600 "$LOG_FILE"
 
-  log "Starting ${APP_NAME} v${APP_VERSION} installer, role=${ROLE}"
+  log "Запускаю установку ${APP_NAME} v${APP_VERSION}, роль=${ROLE}"
   apt_install
   configure_sysctl
 
@@ -1386,8 +1386,8 @@ main() {
     wait_for_port 127.0.0.1 "9091" "Telemt API" 90 || true
   fi
   if [[ "$ROLE" == "edge" ]]; then
-    wait_for_port 127.0.0.1 "${XRAY_LOCAL_PORT}" "Xray local forward" 30 || true
-    wait_for_port 127.0.0.1 "${EDGE_PORT}" "HAProxy public listener" 30 || true
+    wait_for_port 127.0.0.1 "${XRAY_LOCAL_PORT}" "локальный forward Xray" 30 || true
+    wait_for_port 127.0.0.1 "${EDGE_PORT}" "публичный listener HAProxy" 30 || true
   fi
 
   post_install_info
