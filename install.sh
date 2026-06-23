@@ -5,16 +5,20 @@ set -Eeuo pipefail
 #
 # Запускать НА РФ-СЕРВЕРЕ A / EDGE.
 # Скрипт сам спросит SSH-доступ к зарубежному серверу B / EXIT и настроит связку:
-# Telegram client -> A:443/HAProxy -> AmneziaWG tunnel -> B:10.10.10.1:443/Telemt -> Telegram DC
+# Browser -> site-domain:443/HAProxy -> nginx decoy 127.0.0.1:8443
+# Telegram client -> proxy-domain:443/HAProxy -> AmneziaWG tunnel -> B:10.10.10.1:443/Telemt -> Telegram DC
 #
 # Target: clean Ubuntu/Debian VPS with root/sudo. Optimized for Ubuntu 22.04/24.04/26.04.
 
-VERSION="1.3.1"
+VERSION="1.3.3"
 
 EDGE_PUBLIC_HOST=""
+EDGE_SOURCE_IP=""
+SITE_DOMAIN=""
+PROXY_DOMAIN=""
 EXIT_SSH=""
 EXIT_PUBLIC_HOST=""
-TLS_DOMAIN="vk.com"
+TLS_DOMAIN=""
 CLIENT_PORT="443"
 AWG_PORT="8443"
 TELEMT_VERSION="latest"
@@ -54,16 +58,18 @@ Usage:
 
 Или без вопросов:
   bash install.sh \\
+    --site-domain hid-net.ru \\
+    --proxy-domain tg.hid-net.ru \\
     --exit root@IP_ЗАРУБЕЖНОГО_СЕРВЕРА \\
-    --exit-public IP_ЗАРУБЕЖНОГО_СЕРВЕРА \\
-    --edge-public IP_РФ_СЕРВЕРА \\
-    --tls-domain vk.com
+    --exit-public IP_ЗАРУБЕЖНОГО_СЕРВЕРА
 
 Options:
+  --site-domain    Домен сайта-заглушки на РФ-сервере A, например hid-net.ru
+  --proxy-domain   Домен Telegram proxy/SNI, например tg.hid-net.ru
   --exit           SSH до зарубежного сервера B, например root@2.2.2.2
   --exit-public    Публичный IP/домен зарубежного сервера B для AmneziaWG Endpoint
-  --edge-public    Публичный IP/домен этого РФ-сервера A для Telegram proxy-ссылок
-  --tls-domain     SNI/TLS-домен для ee/FakeTLS ссылок. Default: vk.com
+  --edge-public    Совместимость со старыми версиями: то же, что --proxy-domain
+  --tls-domain     Совместимость со старыми версиями: то же, что --proxy-domain
   --client-port    Порт клиентов Telegram на A и Telemt на B. Default: 443
   --awg-port       UDP-порт AmneziaWG на B. Default: 8443
   --telemt-version latest или конкретная версия, например 3.4.18
@@ -78,10 +84,12 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --site-domain) SITE_DOMAIN="${2:-}"; shift 2 ;;
+    --proxy-domain) PROXY_DOMAIN="${2:-}"; shift 2 ;;
     --exit) EXIT_SSH="${2:-}"; shift 2 ;;
     --exit-public) EXIT_PUBLIC_HOST="${2:-}"; shift 2 ;;
-    --edge-public) EDGE_PUBLIC_HOST="${2:-}"; shift 2 ;;
-    --tls-domain) TLS_DOMAIN="${2:-}"; shift 2 ;;
+    --edge-public) EDGE_PUBLIC_HOST="${2:-}"; PROXY_DOMAIN="${2:-}"; shift 2 ;;
+    --tls-domain) TLS_DOMAIN="${2:-}"; PROXY_DOMAIN="${2:-}"; shift 2 ;;
     --client-port) CLIENT_PORT="${2:-}"; shift 2 ;;
     --awg-port) AWG_PORT="${2:-}"; shift 2 ;;
     --telemt-version) TELEMT_VERSION="${2:-}"; shift 2 ;;
@@ -142,6 +150,65 @@ extract_host_from_ssh_target() {
   printf '%s' "$host"
 }
 
+normalize_domain() {
+  local domain="$1"
+  domain="${domain#http://}"
+  domain="${domain#https://}"
+  domain="${domain%%/*}"
+  domain="${domain%.}"
+  printf '%s' "$domain"
+}
+
+is_ipv4() {
+  [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+resolve_ipv4s() {
+  local domain="$1"
+  if command -v dig >/dev/null 2>&1; then
+    dig +short A "$domain" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u || true
+  else
+    getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u || true
+  fi
+}
+
+warn_if_domain_not_points_to_edge() {
+  local domain="$1"
+  local edge_ip="$2"
+  local records=""
+
+  if is_ipv4 "$domain"; then
+    warn "${domain} выглядит как IP, а для v1.3.3 лучше использовать домен. Продолжаю, но маскировка будет слабее."
+    return 0
+  fi
+
+  records="$(resolve_ipv4s "$domain" | paste -sd' ' - | sed 's/[[:space:]]*$//')"
+  if [[ -z "$records" ]]; then
+    warn "DNS A-запись для ${domain} пока не найдена. Проверь, что домен указывает на РФ-сервер A: ${edge_ip}."
+    return 0
+  fi
+
+  if ! grep -qw "$edge_ip" <<< "$records"; then
+    warn "DNS ${domain} сейчас указывает на: ${records}, а публичный IP этого РФ-сервера A: ${edge_ip}."
+    warn "Для корректной схемы ${domain} должен указывать именно на РФ-сервер A."
+  else
+    ok "DNS ${domain} указывает на РФ-сервер A (${edge_ip})"
+  fi
+}
+domain_to_hex() {
+  local domain="$1"
+  printf '%s' "$domain" | od -An -tx1 | tr -d '[:space:]'
+}
+build_ee_proxy_link() {
+  local host="$1"
+  local port="$2"
+  local secret="$3"
+  local sni="$4"
+  local sni_hex
+  sni_hex="$(domain_to_hex "$sni")"
+  printf 'https://t.me/proxy?server=%s&port=%s&secret=ee%s%s' "$host" "$port" "$secret" "$sni_hex"
+}
+
 q() { printf '%q' "$1"; }
 
 rand_int() {
@@ -171,7 +238,7 @@ install_preflight_packages_local() {
 
   clean_amnezia_apt_sources_local
   apt-get update -y
-  apt-get install -y ca-certificates curl openssh-client gnupg2 lsb-release iproute2 jq openssl
+  apt-get install -y ca-certificates curl openssh-client gnupg2 lsb-release iproute2 jq openssl dnsutils
 }
 
 clean_amnezia_apt_sources_local() {
@@ -257,6 +324,7 @@ install_base_packages_local() {
     net-tools \
     jq \
     openssl \
+    dnsutils \
     ufw
 }
 
@@ -421,7 +489,7 @@ configure_awg_b() {
   envs="
     B_PRIVATE_KEY=$(q "$B_PRIVATE_KEY")
     A_PUBLIC_KEY=$(q "$A_PUBLIC_KEY")
-    EDGE_PUBLIC_HOST=$(q "$EDGE_PUBLIC_HOST")
+    EDGE_SOURCE_IP=$(q "$EDGE_SOURCE_IP")
     AWG_PORT=$(q "$AWG_PORT")
     TUNNEL_CIDR_B=$(q "$TUNNEL_CIDR_B")
     TUNNEL_A_IP=$(q "$TUNNEL_A_IP")
@@ -479,7 +547,7 @@ systemctl disable --now awg-quick@awg0 >/dev/null 2>&1 || true
 systemctl enable --now awg-quick@awg0
 
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -qi active; then
-  ufw allow from "${EDGE_PUBLIC_HOST}" to any port "${AWG_PORT}" proto udp || true
+  ufw allow from "${EDGE_SOURCE_IP}" to any port "${AWG_PORT}" proto udp || true
   ufw allow from "${TUNNEL_A_IP}" to any port "${CLIENT_PORT}" proto tcp || true
 fi
 
@@ -632,6 +700,117 @@ exit 1
 REMOTE
 }
 
+install_decoy_nginx_a_local() {
+  export DEBIAN_FRONTEND=noninteractive
+  export NEEDRESTART_MODE=a
+
+  log "Настраиваю сайт-заглушку на РФ-сервере A: https://${SITE_DOMAIN}"
+
+  apt-get update -y
+  apt-get install -y nginx certbot openssl ca-certificates
+
+  local root_dir="/var/www/telemt-decoy"
+  local cert_path="/etc/letsencrypt/live/${SITE_DOMAIN}/fullchain.pem"
+  local key_path="/etc/letsencrypt/live/${SITE_DOMAIN}/privkey.pem"
+
+  mkdir -p "$root_dir/.well-known/acme-challenge"
+  cat > "$root_dir/index.html" <<EOF
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${SITE_DOMAIN}</title>
+  <style>
+    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f7f7f7;color:#222;display:grid;place-items:center;min-height:100vh}
+    main{max-width:720px;background:#fff;border:1px solid #e6e6e6;border-radius:18px;padding:36px;box-shadow:0 12px 40px rgba(0,0,0,.06)}
+    h1{margin:0 0 12px;font-size:28px}p{line-height:1.6;color:#555}.ok{color:#167a3a;font-weight:700}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>${SITE_DOMAIN}</h1>
+    <p class="ok">Service is online.</p>
+    <p>Техническая страница домена. Сервер работает штатно.</p>
+  </main>
+</body>
+</html>
+EOF
+
+  cat > /etc/nginx/sites-available/telemt-decoy-http.conf <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${SITE_DOMAIN};
+
+    root ${root_dir};
+    index index.html;
+
+    location /.well-known/acme-challenge/ {
+        root ${root_dir};
+        try_files \$uri =404;
+    }
+
+    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+}
+EOF
+
+  rm -f /etc/nginx/sites-enabled/default
+  ln -sf /etc/nginx/sites-available/telemt-decoy-http.conf /etc/nginx/sites-enabled/telemt-decoy-http.conf
+  nginx -t
+  systemctl enable --now nginx
+  systemctl reload nginx
+
+  if [[ ! -s "$cert_path" || ! -s "$key_path" ]]; then
+    if ! certbot certonly --webroot \
+      -w "$root_dir" \
+      -d "$SITE_DOMAIN" \
+      --agree-tos \
+      --register-unsafely-without-email \
+      --non-interactive \
+      --keep-until-expiring; then
+      warn "Let's Encrypt сертификат для ${SITE_DOMAIN} получить не удалось. Сделаю временный self-signed сертификат, чтобы nginx запустился."
+      cert_path="/etc/ssl/certs/telemt-decoy-${SITE_DOMAIN}.crt"
+      key_path="/etc/ssl/private/telemt-decoy-${SITE_DOMAIN}.key"
+      openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+        -keyout "$key_path" \
+        -out "$cert_path" \
+        -subj "/CN=${SITE_DOMAIN}" >/dev/null 2>&1
+      chmod 600 "$key_path"
+    fi
+  fi
+
+  cat > /etc/nginx/sites-available/telemt-decoy-https-internal.conf <<EOF
+server {
+    listen 127.0.0.1:8443 ssl http2;
+    server_name ${SITE_DOMAIN};
+
+    ssl_certificate     ${cert_path};
+    ssl_certificate_key ${key_path};
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    root ${root_dir};
+    index index.html;
+
+    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+}
+EOF
+
+  ln -sf /etc/nginx/sites-available/telemt-decoy-https-internal.conf /etc/nginx/sites-enabled/telemt-decoy-https-internal.conf
+  nginx -t
+  systemctl reload nginx
+
+  if command -v ufw >/dev/null 2>&1 && ufw status | grep -qi active; then
+    ufw allow 80/tcp || true
+  fi
+
+  ok "Сайт-заглушка готов: https://${SITE_DOMAIN} через HAProxy -> nginx 127.0.0.1:8443"
+}
+
 install_haproxy_a_local() {
   export DEBIAN_FRONTEND=noninteractive
   export NEEDRESTART_MODE=a
@@ -670,7 +849,20 @@ frontend tcp_in_${CLIENT_PORT}
     bind *:${CLIENT_PORT}
     maxconn 8000
     option tcp-smart-accept
+
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req.ssl_hello_type 1 }
+
+    acl sni_decoy req.ssl_sni -i ${SITE_DOMAIN}
+    acl sni_proxy req.ssl_sni -i ${PROXY_DOMAIN}
+
+    use_backend nginx_decoy if sni_decoy
+    use_backend telemt_nodes if sni_proxy
     default_backend telemt_nodes
+
+backend nginx_decoy
+    option tcp-smart-connect
+    server nginx_local 127.0.0.1:8443 check inter 5s rise 2 fall 3
 
 backend telemt_nodes
     option tcp-smart-connect
@@ -686,6 +878,81 @@ EOF
   if command -v ufw >/dev/null 2>&1 && ufw status | grep -qi active; then
     ufw allow "${CLIENT_PORT}/tcp" || true
   fi
+}
+
+choose_recommended_link() {
+  # Из всех ссылок Telemt выбираем одну основную: FakeTLS/EE, желательно https://t.me/...
+  local links="$1"
+  local recommended=""
+
+  recommended="$(printf '%s\n' "$links" | grep -E '^https://t\.me/(proxy|mtproxy)\?' | grep -E 'secret=ee|secret%3Dee' | head -n 1 || true)"
+  if [[ -z "$recommended" ]]; then
+    recommended="$(printf '%s\n' "$links" | grep -E '^tg://proxy\?' | grep -E 'secret=ee|secret%3Dee' | head -n 1 || true)"
+  fi
+  if [[ -z "$recommended" ]]; then
+    recommended="$(printf '%s\n' "$links" | grep -E '^https://t\.me/(proxy|mtproxy)\?' | head -n 1 || true)"
+  fi
+  if [[ -z "$recommended" ]]; then
+    recommended="$(printf '%s\n' "$links" | grep -E '^tg://proxy\?' | head -n 1 || true)"
+  fi
+  if [[ -z "$recommended" ]]; then
+    recommended="$(printf '%s\n' "$links" | head -n 1 || true)"
+  fi
+
+  printf '%s' "$recommended"
+}
+
+print_final_proxy_link() {
+  local link="$1"
+  local green='\033[1;32m'
+  local cyan='\033[1;36m'
+  local reset='\033[0m'
+
+  if [[ -z "$link" ]]; then
+    warn "Telemt не вернул ссылку через API. Проверь: ssh ${EXIT_SSH} 'curl -s http://127.0.0.1:9091/v1/users | jq'"
+    return 0
+  fi
+
+  printf '\n'
+  printf "${green}================================================================${reset}\n"
+  printf "${green}✅ ИТОГОВАЯ ССЫЛКА ДЛЯ TELEGRAM${reset}\n"
+  printf "${green}================================================================${reset}\n"
+  printf "${green}%s${reset}\n" "$link"
+  printf "${cyan}Кликабельная ссылка:${reset} "
+  # OSC-8 hyperlink. В терминалах, где OSC-8 не поддерживается, ниже всё равно есть обычный URL.
+  printf '\033]8;;%s\aОткрыть прокси в Telegram\033]8;;\a\n' "$link"
+  printf "${cyan}Обычный URL для копирования:${reset}\n%s\n" "$link"
+  printf "${green}================================================================${reset}\n\n"
+}
+
+print_antiblock_diagnostics() {
+  cat <<EOF
+
+Если с VPN на устройстве прокси работает, а без VPN из РФ пишет «недоступен»,
+то сама связка A -> B, скорее всего, живая. Нужно понять, доходит ли трафик
+без VPN до РФ-сервера A.
+
+Быстрая проверка на РФ-сервере A:
+
+  1) Запусти прослушку входящих подключений на ${CLIENT_PORT}/tcp:
+     timeout 90 tcpdump -ni any 'tcp port ${CLIENT_PORT}'
+
+  2) Пока команда работает, на телефоне/ПК БЕЗ VPN попробуй подключить прокси.
+
+Как читать результат:
+
+  - Если в tcpdump НЕТ пакетов от твоего клиента — трафик режется до сервера A:
+    оператор/маршрут/провайдер/блокировка IP/порта. Решение: менять IP/провайдера A,
+    пробовать другой порт или ставить A в другой сети.
+
+  - Если SYN приходит на A, но Telemt на B молчит — проблема в HAProxy/туннеле:
+    journalctl -u haproxy -f
+    awg show
+
+  - Если пакеты доходят до B/Telemt, но Telegram не подключается — будем менять
+    TLS/SNI-домен, режим выдачи ссылки и параметры маскировки Telemt.
+
+EOF
 }
 
 get_final_links_from_b() {
@@ -738,8 +1005,12 @@ print_summary() {
 ГОТОВО.
 
 Схема:
-  Telegram client -> ${EDGE_PUBLIC_HOST}:${CLIENT_PORT}
+  Обычный браузер -> https://${SITE_DOMAIN}
                   -> HAProxy на РФ-сервере A
+                  -> nginx-заглушка 127.0.0.1:8443
+
+  Telegram client -> ${PROXY_DOMAIN}:${CLIENT_PORT}
+                  -> HAProxy на РФ-сервере A по SNI ${PROXY_DOMAIN}
                   -> AmneziaWG tunnel
                   -> Telemt на зарубежном B / ${TUNNEL_B_IP}:${CLIENT_PORT}
                   -> Telegram DC
@@ -748,9 +1019,10 @@ print_summary() {
 
   A / РФ / этот сервер:
     TCP ${CLIENT_PORT} from clients
+    TCP 80 для выпуска/обновления Let's Encrypt сертификата сайта-заглушки
 
   B / зарубежный:
-    UDP ${AWG_PORT} from ${EDGE_PUBLIC_HOST}
+    UDP ${AWG_PORT} from ${EDGE_SOURCE_IP}
 
 Команды диагностики на РФ-сервере A:
   systemctl status awg-quick@awg0 haproxy --no-pager
@@ -779,7 +1051,8 @@ main() {
   1) этот сервер станет входной точкой для Telegram-клиентов;
   2) я спрошу SSH-доступ к зарубежному VPS B;
   3) сам настрою оба сервера в схему A -> B;
-  4) в конце покажу готовые Telegram proxy-ссылки.
+  4) подниму сайт-заглушку для реального домена;
+  5) в конце покажу одну главную зелёную Telegram proxy-ссылку.
 
 Пароли от SSH я не храню: если вход на B по паролю, его спросит обычный ssh.
 
@@ -787,36 +1060,50 @@ EOF
 
   local detected_edge_ip
   detected_edge_ip="$(detect_public_ip)"
+  EDGE_SOURCE_IP="$detected_edge_ip"
 
-  echo "Шаг 1/7. Укажи адрес этого РФ-сервера A — он попадёт в ссылку для Telegram."
-  prompt EDGE_PUBLIC_HOST "Публичный IP или домен РФ-сервера A" "$detected_edge_ip"
+  echo "Шаг 1/8. Укажи домен сайта-заглушки на РФ-сервере A."
+  echo "Пример: hid-net.ru. Этот домен должен A-записью указывать на IP этого РФ-сервера: ${detected_edge_ip}"
+  prompt SITE_DOMAIN "Домен сайта-заглушки" "$SITE_DOMAIN"
+  SITE_DOMAIN="$(normalize_domain "$SITE_DOMAIN")"
 
   echo
-  echo "Шаг 2/7. Укажи SSH-доступ к зарубежному серверу B, где будет работать Telemt."
+  echo "Шаг 2/8. Укажи домен Telegram proxy/SNI."
+  echo "Лучший вариант: отдельный поддомен, например tg.${SITE_DOMAIN}. Он тоже должен указывать на этот РФ-сервер A."
+  if [[ -z "$PROXY_DOMAIN" ]]; then
+    PROXY_DOMAIN="tg.${SITE_DOMAIN}"
+  fi
+  prompt PROXY_DOMAIN "Домен proxy/SNI" "$PROXY_DOMAIN"
+  PROXY_DOMAIN="$(normalize_domain "$PROXY_DOMAIN")"
+
+  EDGE_PUBLIC_HOST="$PROXY_DOMAIN"
+  TLS_DOMAIN="$PROXY_DOMAIN"
+
+  echo
+  echo "Шаг 3/8. Укажи SSH-доступ к зарубежному серверу B, где будет работать Telemt."
   echo "Пример: root@2.2.2.2"
   prompt EXIT_SSH "SSH к зарубежному серверу B" ""
 
   echo
-  echo "Шаг 3/7. Укажи публичный IP или домен зарубежного сервера B."
+  echo "Шаг 4/8. Укажи публичный IP или домен зарубежного сервера B."
   echo "Обычно это тот же IP, что в SSH после root@. Он нужен серверу A для подключения к туннелю."
   default_exit_public="$(extract_host_from_ssh_target "$EXIT_SSH")"
   prompt EXIT_PUBLIC_HOST "Публичный IP или домен зарубежного B" "$default_exit_public"
 
   echo
-  echo "Шаг 4/7. Укажи TLS/SNI-домен для маскировки. Можно оставить значение по умолчанию."
-  prompt TLS_DOMAIN "TLS/SNI-домен" "$TLS_DOMAIN"
-
-  echo
-  echo "Шаг 5/7. Порт, который будет открыт для клиентов Telegram на РФ-сервере A. Обычно 443."
+  echo "Шаг 5/8. Порт, который будет открыт для клиентов Telegram на РФ-сервере A. Обычно 443."
   prompt CLIENT_PORT "TCP-порт для клиентов Telegram" "$CLIENT_PORT"
 
   echo
-  echo "Шаг 6/7. UDP-порт туннеля AmneziaWG на зарубежном B. Обычно 8443."
+  echo "Шаг 6/8. UDP-порт туннеля AmneziaWG на зарубежном B. Обычно 8443."
   prompt AWG_PORT "UDP-порт AmneziaWG" "$AWG_PORT"
 
   echo
-  echo "Шаг 7/7. Версия Telemt. Обычно оставляем latest."
+  echo "Шаг 7/8. Версия Telemt. Обычно оставляем latest."
   prompt TELEMT_VERSION "Версия Telemt" "$TELEMT_VERSION"
+
+  echo
+  echo "Шаг 8/8. Проверяю DNS-логику: сайт и proxy-домен должны указывать на РФ-сервер A."
 
   if [[ -z "$SSH_OPTS_STRING" ]]; then
     echo
@@ -833,9 +1120,10 @@ EOF
 Проверь роли перед установкой:
 
   A / EDGE / РФ / ЭТОТ СЕРВЕР:
-    public host: ${EDGE_PUBLIC_HOST}
-    client TCP:  ${CLIENT_PORT}
-    будет установлено: AmneziaWG + HAProxy
+    site domain:  ${SITE_DOMAIN}
+    proxy domain: ${PROXY_DOMAIN}
+    client TCP:   ${CLIENT_PORT}
+    будет установлено: AmneziaWG + HAProxy + nginx-заглушка
 
   B / EXIT / зарубежный сервер:
     ssh:         ${EXIT_SSH}
@@ -858,6 +1146,9 @@ EOF
   log "Подготавливаю РФ-сервер A: ставлю базовые пакеты для установки"
   install_preflight_packages_local
   ok "Базовые пакеты на A готовы"
+
+  warn_if_domain_not_points_to_edge "$SITE_DOMAIN" "$detected_edge_ip"
+  warn_if_domain_not_points_to_edge "$PROXY_DOMAIN" "$detected_edge_ip"
 
   build_ssh_arrays
 
@@ -912,7 +1203,7 @@ EOF
   if check_tunnel_local; then
     ok "Туннель A -> B работает"
   else
-    warn "Туннель A -> B пока не прошёл проверку. Проверь cloud firewall: на B должен быть открыт UDP ${AWG_PORT} от ${EDGE_PUBLIC_HOST}. Продолжаю установку."
+    warn "Туннель A -> B пока не прошёл проверку. Проверь cloud firewall: на B должен быть открыт UDP ${AWG_PORT} от ${EDGE_SOURCE_IP}. Продолжаю установку."
   fi
 
   log "Устанавливаю и настраиваю Telemt на зарубежном B"
@@ -925,15 +1216,33 @@ EOF
     warn "A пока не видит Telemt на B через туннель. Чаще всего причина — закрыт UDP ${AWG_PORT} на зарубежном B в cloud firewall провайдера. HAProxy всё равно установлю, но ссылку нужно тестировать после открытия порта."
   fi
 
+  log "Устанавливаю nginx-заглушку на РФ-сервере A"
+  install_decoy_nginx_a_local
+  ok "nginx-заглушка на A готова"
+
   log "Устанавливаю и настраиваю HAProxy на РФ-сервере A"
   install_haproxy_a_local
   ok "HAProxy на A запущен"
 
   log "Получаю готовые Telegram proxy-ссылки с B"
   LINKS_OUTPUT="$(get_final_links_from_b || true)"
-  printf '%s\n' "$LINKS_OUTPUT"
+
+  ALL_PROXY_LINKS="$(printf '%s\n' "$LINKS_OUTPUT" | awk '/__LINKS_BEGIN/{flag=1;next}/__LINKS_END/{flag=0}flag && NF')"
+  # Главную ссылку собираем сами, чтобы гарантировать совпадение:
+  # server=${PROXY_DOMAIN}, tls_domain=${PROXY_DOMAIN}, secret=ee + TELEMT_SECRET + hex(PROXY_DOMAIN)
+  FINAL_PROXY_LINK="$(build_ee_proxy_link "$PROXY_DOMAIN" "$CLIENT_PORT" "$TELEMT_SECRET" "$TLS_DOMAIN")"
+
+  print_final_proxy_link "$FINAL_PROXY_LINK"
+
+  if [[ -n "$ALL_PROXY_LINKS" ]]; then
+    echo "Все ссылки, которые вернул Telemt:"
+    printf '%s\n' "$ALL_PROXY_LINKS" | sed 's/^/  - /'
+  else
+    printf '%s\n' "$LINKS_OUTPUT"
+  fi
 
   print_summary
+  print_antiblock_diagnostics
 }
 
 main "$@"
