@@ -9,7 +9,7 @@ set -Eeuo pipefail
 #
 # Target: clean Ubuntu/Debian VPS with root/sudo. Optimized for Ubuntu 22.04/24.04/26.04.
 
-VERSION="1.2.0"
+VERSION="1.3.1"
 
 EDGE_PUBLIC_HOST=""
 EXIT_SSH=""
@@ -312,9 +312,22 @@ ssh_b() {
 }
 
 remote_b() {
-  local env_string="${1:-:}"
-  local setup_env="set -a; ${env_string}; set +a;"
-  ssh_b "if [ \"\$(id -u)\" -eq 0 ]; then ${setup_env} bash -s; elif command -v sudo >/dev/null 2>&1; then ${setup_env} sudo -E bash -s; else echo 'Need root or sudo on EXIT server' >&2; exit 1; fi"
+  local env_string="${1:-}"
+  local env_prefix=""
+  local line=""
+
+  # env_string приходит как многострочный список безопасно экранированных VAR=value.
+  # Не вставляем его через `set -a; ...;`, потому что пустые/отступные строки
+  # могут превратиться в одиночный `;` и сломать remote bash.
+  while IFS= read -r line; do
+    # trim leading/trailing whitespace
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+    env_prefix+="${line} "
+  done <<< "$env_string"
+
+  ssh_b "if [ \"\$(id -u)\" -eq 0 ]; then ${env_prefix}bash -s; elif command -v sudo >/dev/null 2>&1; then ${env_prefix}sudo -E bash -s; else echo 'Need root or sudo on EXIT server' >&2; exit 1; fi"
 }
 
 install_awg_remote_b_and_get_keys() {
