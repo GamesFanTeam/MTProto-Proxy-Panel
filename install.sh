@@ -7,9 +7,9 @@ set -Eeuo pipefail
 # Скрипт сам спросит SSH-доступ к зарубежному серверу B / EXIT и настроит связку:
 # Telegram client -> A:443/HAProxy -> AmneziaWG tunnel -> B:10.10.10.1:443/Telemt -> Telegram DC
 #
-# Target: Ubuntu 22.04/24.04/26.04-like VPS with root/sudo.
+# Target: clean Ubuntu/Debian VPS with root/sudo. Optimized for Ubuntu 22.04/24.04/26.04.
 
-VERSION="edge-first-1.0.0"
+VERSION="1.2.0"
 
 EDGE_PUBLIC_HOST=""
 EXIT_SSH=""
@@ -44,16 +44,16 @@ trap 'die "Ошибка на строке $LINENO. Установка остан
 
 usage() {
   cat <<EOF
-telemt-doublehop-edge-first-install.sh v${VERSION}
+install.sh / telemt-doublehop edge-first v${VERSION}
 
 Запускать НА РФ-СЕРВЕРЕ A / EDGE.
 Скрипт спросит зарубежный сервер B / EXIT и настроит double-hop.
 
 Usage:
-  bash telemt-doublehop-edge-first-install.sh
+  bash install.sh
 
 Или без вопросов:
-  bash telemt-doublehop-edge-first-install.sh \\
+  bash install.sh \\
     --exit root@IP_ЗАРУБЕЖНОГО_СЕРВЕРА \\
     --exit-public IP_ЗАРУБЕЖНОГО_СЕРВЕРА \\
     --edge-public IP_РФ_СЕРВЕРА \\
@@ -67,12 +67,12 @@ Options:
   --client-port    Порт клиентов Telegram на A и Telemt на B. Default: 443
   --awg-port       UDP-порт AmneziaWG на B. Default: 8443
   --telemt-version latest или конкретная версия, например 3.4.18
-  --ssh-opts       Дополнительные SSH-опции к B, например '-i ~/.ssh/id_ed25519 -p 22'
+  --ssh-opts       Дополнительные SSH-опции к B, например '-i /root/.ssh/id_ed25519 -p 22'
   -y, --yes        Не спрашивать финальное подтверждение
   -h, --help       Помощь
 
 Можно также передать SSH_OPTS через окружение:
-  SSH_OPTS='-i ~/.ssh/id_ed25519 -p 22' bash telemt-doublehop-edge-first-install.sh
+  SSH_OPTS='-i /root/.ssh/id_ed25519 -p 22' bash install.sh
 EOF
 }
 
@@ -134,6 +134,14 @@ detect_public_ip() {
   printf '%s' "$ip"
 }
 
+extract_host_from_ssh_target() {
+  local target="$1"
+  local host=""
+  host="${target##*@}"
+  host="${host%%:*}"
+  printf '%s' "$host"
+}
+
 q() { printf '%q' "$1"; }
 
 rand_int() {
@@ -155,14 +163,91 @@ validate_port() {
   (( value >= 1 && value <= 65535 )) || die "$name вне диапазона 1..65535"
 }
 
-install_base_packages_local() {
+install_preflight_packages_local() {
   export DEBIAN_FRONTEND=noninteractive
+  export NEEDRESTART_MODE=a
+
   command -v apt-get >/dev/null 2>&1 || die "Скрипт рассчитан на Ubuntu/Debian с apt-get. Лучше использовать чистый Ubuntu VPS."
 
+  clean_amnezia_apt_sources_local
+  apt-get update -y
+  apt-get install -y ca-certificates curl openssh-client gnupg2 lsb-release iproute2 jq openssl
+}
+
+clean_amnezia_apt_sources_local() {
+  # После старых попыток установки может остаться PPA под неподдерживаемый codename
+  # вроде Ubuntu 26.04 resolute. Он ломает любой apt-get update, поэтому чистим его заранее.
+  rm -f /etc/apt/sources.list.d/*amnezia* 2>/dev/null || true
+  rm -f /etc/apt/sources.list.d/*launchpadcontent*amnezia* 2>/dev/null || true
+  rm -f /etc/apt/sources.list.d/*ppa_launchpadcontent_net_amnezia* 2>/dev/null || true
+
+  if [[ -f /etc/apt/sources.list ]]; then
+    sed -i.bak.telemt-dh \
+      -e '/ppa\.launchpadcontent\.net\/amnezia\/ppa/d' \
+      -e '/ppa\.launchpad\.net\/amnezia\/ppa/d' \
+      /etc/apt/sources.list || true
+  fi
+}
+
+choose_amnezia_ppa_suite_local() {
+  local os_id="" codename="" suite=""
+  # shellcheck disable=SC1091
+  [[ -f /etc/os-release ]] && . /etc/os-release
+  os_id="${ID:-}"
+  codename="${VERSION_CODENAME:-}"
+
+  if [[ "$os_id" == "ubuntu" ]]; then
+    case "$codename" in
+      focal|jammy|noble) suite="$codename" ;;
+      # Ubuntu 25.10/26.04 и другие свежие релизы часто ещё не имеют отдельного PPA.
+      # Для них используем noble fallback.
+      *) suite="noble" ;;
+    esac
+  else
+    # Для Debian в публичных инструкциях AmneziaWG обычно используется focal PPA.
+    suite="focal"
+  fi
+
+  printf '%s' "$suite"
+}
+
+setup_amnezia_repo_local() {
+  local suite
+  suite="$(choose_amnezia_ppa_suite_local)"
+
+  log "Подключаю репозиторий AmneziaWG через PPA suite: ${suite}"
+  clean_amnezia_apt_sources_local
+
+  install -d -m 0755 /usr/share/keyrings
+  rm -f /usr/share/keyrings/amnezia-archive-keyring.gpg.tmp
+
+  if ! curl -fsSL 'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x57290828' \
+    | gpg --dearmor -o /usr/share/keyrings/amnezia-archive-keyring.gpg.tmp; then
+    warn "Не удалось получить ключ AmneziaWG через curl. Пробую через gpg keyserver."
+    gpg --batch --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 57290828
+    gpg --batch --export 57290828 | gpg --dearmor -o /usr/share/keyrings/amnezia-archive-keyring.gpg.tmp
+  fi
+
+  mv -f /usr/share/keyrings/amnezia-archive-keyring.gpg.tmp /usr/share/keyrings/amnezia-archive-keyring.gpg
+  chmod 0644 /usr/share/keyrings/amnezia-archive-keyring.gpg
+
+  cat > /etc/apt/sources.list.d/amnezia-ppa.list <<EOF
+# AmneziaWG PPA. For unsupported Ubuntu codenames, installer intentionally uses a supported fallback suite.
+deb [signed-by=/usr/share/keyrings/amnezia-archive-keyring.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu ${suite} main
+EOF
+}
+
+install_base_packages_local() {
+  export DEBIAN_FRONTEND=noninteractive
+  export NEEDRESTART_MODE=a
+  command -v apt-get >/dev/null 2>&1 || die "Скрипт рассчитан на Ubuntu/Debian с apt-get. Лучше использовать чистый Ubuntu VPS."
+
+  clean_amnezia_apt_sources_local
   apt-get update -y
   apt-get install -y \
     ca-certificates \
     curl \
+    openssh-client \
     gnupg2 \
     software-properties-common \
     python3-launchpadlib \
@@ -180,10 +265,17 @@ install_awg_local() {
   apt-get install -y "linux-headers-$(uname -r)" || true
 
   if ! command -v awg >/dev/null 2>&1; then
-    add-apt-repository -y ppa:amnezia/ppa
+    setup_amnezia_repo_local
     apt-get update -y
-    apt-get install -y amneziawg
+    if ! apt-get install -y amneziawg; then
+      warn "Пакет amneziawg не установился метапакетом. Пробую amneziawg-dkms + amneziawg-tools."
+      apt-get install -y amneziawg-dkms amneziawg-tools
+    fi
   fi
+
+  command -v awg >/dev/null 2>&1 || die "Команда awg не найдена после установки AmneziaWG."
+  command -v awg-quick >/dev/null 2>&1 || die "Команда awg-quick не найдена после установки AmneziaWG."
+  modprobe amneziawg >/dev/null 2>&1 || true
 
   mkdir -p /etc/amnezia/amneziawg
   chmod 700 /etc/amnezia/amneziawg
@@ -232,6 +324,19 @@ export DEBIAN_FRONTEND=noninteractive
 
 command -v apt-get >/dev/null 2>&1 || { echo "Only apt-based Ubuntu/Debian systems are supported" >&2; exit 1; }
 
+export NEEDRESTART_MODE=a
+
+# Чистим старые/битые amnezia PPA, например Ubuntu 26.04 resolute без Release-файла.
+rm -f /etc/apt/sources.list.d/*amnezia* 2>/dev/null || true
+rm -f /etc/apt/sources.list.d/*launchpadcontent*amnezia* 2>/dev/null || true
+rm -f /etc/apt/sources.list.d/*ppa_launchpadcontent_net_amnezia* 2>/dev/null || true
+if [ -f /etc/apt/sources.list ]; then
+  sed -i.bak.telemt-dh \
+    -e '/ppa\.launchpadcontent\.net\/amnezia\/ppa/d' \
+    -e '/ppa\.launchpad\.net\/amnezia\/ppa/d' \
+    /etc/apt/sources.list || true
+fi
+
 apt-get update -y
 apt-get install -y \
   ca-certificates \
@@ -249,10 +354,38 @@ apt-get install -y \
 apt-get install -y "linux-headers-$(uname -r)" || true
 
 if ! command -v awg >/dev/null 2>&1; then
-  add-apt-repository -y ppa:amnezia/ppa
+  . /etc/os-release
+  case "${ID:-}:${VERSION_CODENAME:-}" in
+    ubuntu:focal|ubuntu:jammy|ubuntu:noble) AWG_SUITE="${VERSION_CODENAME}" ;;
+    ubuntu:*) AWG_SUITE="noble" ;;
+    *) AWG_SUITE="focal" ;;
+  esac
+
+  echo "Using AmneziaWG PPA suite: ${AWG_SUITE}"
+  install -d -m 0755 /usr/share/keyrings
+  rm -f /usr/share/keyrings/amnezia-archive-keyring.gpg.tmp
+
+  if ! curl -fsSL 'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x57290828' \
+    | gpg --dearmor -o /usr/share/keyrings/amnezia-archive-keyring.gpg.tmp; then
+    gpg --batch --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 57290828
+    gpg --batch --export 57290828 | gpg --dearmor -o /usr/share/keyrings/amnezia-archive-keyring.gpg.tmp
+  fi
+
+  mv -f /usr/share/keyrings/amnezia-archive-keyring.gpg.tmp /usr/share/keyrings/amnezia-archive-keyring.gpg
+  chmod 0644 /usr/share/keyrings/amnezia-archive-keyring.gpg
+
+  cat > /etc/apt/sources.list.d/amnezia-ppa.list <<EOF
+# AmneziaWG PPA. For unsupported Ubuntu codenames, installer intentionally uses a supported fallback suite.
+deb [signed-by=/usr/share/keyrings/amnezia-archive-keyring.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu ${AWG_SUITE} main
+EOF
+
   apt-get update -y
-  apt-get install -y amneziawg
+  apt-get install -y amneziawg || apt-get install -y amneziawg-dkms amneziawg-tools
 fi
+
+command -v awg >/dev/null 2>&1 || { echo "awg command not found after AmneziaWG installation" >&2; exit 1; }
+command -v awg-quick >/dev/null 2>&1 || { echo "awg-quick command not found after AmneziaWG installation" >&2; exit 1; }
+modprobe amneziawg >/dev/null 2>&1 || true
 
 mkdir -p /etc/amnezia/amneziawg
 chmod 700 /etc/amnezia/amneziawg
@@ -398,6 +531,7 @@ install_telemt_b() {
   remote_b "$envs" <<'REMOTE'
 set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
 
 apt-get update -y
 apt-get install -y curl jq openssl iproute2 net-tools ca-certificates
@@ -487,6 +621,7 @@ REMOTE
 
 install_haproxy_a_local() {
   export DEBIAN_FRONTEND=noninteractive
+  export NEEDRESTART_MODE=a
   apt-get update -y
   apt-get install -y haproxy iproute2 net-tools curl
 
@@ -563,8 +698,24 @@ REMOTE
 
 check_tunnel_local() {
   log "Проверяю туннель A -> B"
-  ping -c 3 "$TUNNEL_B_IP" || return 1
-  timeout 5 bash -c "cat < /dev/null > /dev/tcp/${TUNNEL_B_IP}/${CLIENT_PORT}" || return 1
+
+  # Пингуем внутренний адрес B, чтобы спровоцировать handshake.
+  ping -c 3 "$TUNNEL_B_IP" >/dev/null 2>&1 || true
+
+  local latest now
+  latest="$(awg show awg0 latest-handshakes 2>/dev/null | awk '{print $2}' | head -n 1 || true)"
+  now="$(date +%s)"
+
+  if [[ -n "$latest" && "$latest" =~ ^[0-9]+$ && "$latest" -gt 0 && $((now - latest)) -le 180 ]]; then
+    return 0
+  fi
+
+  return 1
+}
+
+check_telemt_internal_from_a() {
+  log "Проверяю доступ A -> B:${CLIENT_PORT} внутри туннеля"
+  timeout 6 bash -c "cat < /dev/null > /dev/tcp/${TUNNEL_B_IP}/${CLIENT_PORT}" >/dev/null 2>&1
 }
 
 print_summary() {
@@ -609,25 +760,56 @@ main() {
   log "Telemt double-hop edge-first installer v${VERSION}"
   cat <<'EOF'
 
-Запусти этот файл НА РФ-СЕРВЕРЕ A.
-Этот сервер станет входом для Telegram-клиентов.
-Зарубежный сервер B будет настроен по SSH из этого скрипта.
+Привет. Это финальный установщик для чистых VPS. Запускать его нужно именно НА РФ-СЕРВЕРЕ A.
+
+Что будет дальше:
+  1) этот сервер станет входной точкой для Telegram-клиентов;
+  2) я спрошу SSH-доступ к зарубежному VPS B;
+  3) сам настрою оба сервера в схему A -> B;
+  4) в конце покажу готовые Telegram proxy-ссылки.
+
+Пароли от SSH я не храню: если вход на B по паролю, его спросит обычный ssh.
 
 EOF
 
   local detected_edge_ip
   detected_edge_ip="$(detect_public_ip)"
 
-  prompt EDGE_PUBLIC_HOST "Публичный IP/домен ЭТОГО РФ-сервера A для Telegram proxy-ссылок" "$detected_edge_ip"
-  prompt EXIT_SSH "SSH до зарубежного сервера B / EXIT, например root@2.2.2.2"
-  prompt EXIT_PUBLIC_HOST "Публичный IP/домен зарубежного сервера B для AmneziaWG Endpoint"
-  prompt TLS_DOMAIN "TLS/SNI-домен для FakeTLS/ee-ссылок" "$TLS_DOMAIN"
-  prompt CLIENT_PORT "Порт клиентов Telegram на РФ-сервере A" "$CLIENT_PORT"
-  prompt AWG_PORT "UDP-порт AmneziaWG на зарубежном B" "$AWG_PORT"
-  prompt TELEMT_VERSION "Версия Telemt: latest или конкретная версия" "$TELEMT_VERSION"
+  echo "Шаг 1/7. Укажи адрес этого РФ-сервера A — он попадёт в ссылку для Telegram."
+  prompt EDGE_PUBLIC_HOST "Публичный IP или домен РФ-сервера A" "$detected_edge_ip"
+
+  echo
+  echo "Шаг 2/7. Укажи SSH-доступ к зарубежному серверу B, где будет работать Telemt."
+  echo "Пример: root@2.2.2.2"
+  prompt EXIT_SSH "SSH к зарубежному серверу B" ""
+
+  echo
+  echo "Шаг 3/7. Укажи публичный IP или домен зарубежного сервера B."
+  echo "Обычно это тот же IP, что в SSH после root@. Он нужен серверу A для подключения к туннелю."
+  default_exit_public="$(extract_host_from_ssh_target "$EXIT_SSH")"
+  prompt EXIT_PUBLIC_HOST "Публичный IP или домен зарубежного B" "$default_exit_public"
+
+  echo
+  echo "Шаг 4/7. Укажи TLS/SNI-домен для маскировки. Можно оставить значение по умолчанию."
+  prompt TLS_DOMAIN "TLS/SNI-домен" "$TLS_DOMAIN"
+
+  echo
+  echo "Шаг 5/7. Порт, который будет открыт для клиентов Telegram на РФ-сервере A. Обычно 443."
+  prompt CLIENT_PORT "TCP-порт для клиентов Telegram" "$CLIENT_PORT"
+
+  echo
+  echo "Шаг 6/7. UDP-порт туннеля AmneziaWG на зарубежном B. Обычно 8443."
+  prompt AWG_PORT "UDP-порт AmneziaWG" "$AWG_PORT"
+
+  echo
+  echo "Шаг 7/7. Версия Telemt. Обычно оставляем latest."
+  prompt TELEMT_VERSION "Версия Telemt" "$TELEMT_VERSION"
 
   if [[ -z "$SSH_OPTS_STRING" ]]; then
-    read -r -p "Дополнительные SSH-опции к B, если нужны [-i key -p port], иначе Enter: " SSH_OPTS_STRING </dev/tty || SSH_OPTS_STRING=""
+    echo
+    echo "Дополнительно: если для SSH к B нужен ключ или нестандартный порт, укажи опции."
+    echo "Пример: -i /root/.ssh/id_ed25519 -p 2222"
+    read -r -p "SSH-опции к B, или просто Enter: " SSH_OPTS_STRING </dev/tty || SSH_OPTS_STRING=""
   fi
 
   validate_port "$CLIENT_PORT" "client-port"
@@ -653,12 +835,16 @@ EOF
 EOF
 
   if [[ "$ASSUME_YES" != "1" ]]; then
-    read -r -p "Продолжить установку? [y/N]: " confirm </dev/tty || confirm=""
+    read -r -p "Всё верно? Начинаю установку. Введи y и нажми Enter [y/N]: " confirm </dev/tty || confirm=""
     case "$confirm" in
       y|Y|yes|YES|да|ДА) ;;
       *) die "Отменено пользователем." ;;
     esac
   fi
+
+  log "Подготавливаю РФ-сервер A: ставлю базовые пакеты для установки"
+  install_preflight_packages_local
+  ok "Базовые пакеты на A готовы"
 
   build_ssh_arrays
 
@@ -719,6 +905,12 @@ EOF
   log "Устанавливаю и настраиваю Telemt на зарубежном B"
   install_telemt_b
   ok "Telemt на B запущен"
+
+  if check_telemt_internal_from_a; then
+    ok "A видит Telemt на B через туннель"
+  else
+    warn "A пока не видит Telemt на B через туннель. Чаще всего причина — закрыт UDP ${AWG_PORT} на зарубежном B в cloud firewall провайдера. HAProxy всё равно установлю, но ссылку нужно тестировать после открытия порта."
+  fi
 
   log "Устанавливаю и настраиваю HAProxy на РФ-сервере A"
   install_haproxy_a_local
