@@ -8,9 +8,9 @@ set -Eeuo pipefail
 # Browser -> site-domain:443/HAProxy -> nginx decoy 127.0.0.1:8443
 # Telegram client -> proxy-domain:443/HAProxy -> AmneziaWG tunnel -> B:10.10.10.1:443/Telemt -> Telegram DC
 #
-# Target: clean Ubuntu/Debian VPS with root/sudo. Optimized for Ubuntu 22.04/24.04/26.04.
+# Target: clean Ubuntu/Debian VPS with root/sudo. Optimized for clean Ubuntu 22.04/24.04/26.04.
 
-VERSION="1.3.3"
+VERSION="1.3.4"
 
 EDGE_PUBLIC_HOST=""
 EDGE_SOURCE_IP=""
@@ -853,7 +853,7 @@ frontend tcp_in_${CLIENT_PORT}
     tcp-request inspect-delay 5s
     tcp-request content accept if { req.ssl_hello_type 1 }
 
-    acl sni_decoy req.ssl_sni -i ${SITE_DOMAIN}
+    acl sni_decoy req.ssl_sni -i ${SITE_DOMAIN} www.${SITE_DOMAIN}
     acl sni_proxy req.ssl_sni -i ${PROXY_DOMAIN}
 
     use_backend nginx_decoy if sni_decoy
@@ -1015,6 +1015,11 @@ print_summary() {
                   -> Telemt на зарубежном B / ${TUNNEL_B_IP}:${CLIENT_PORT}
                   -> Telegram DC
 
+Контроль DNS:
+  ${SITE_DOMAIN} должен указывать на ${EDGE_SOURCE_IP}
+  ${PROXY_DOMAIN} должен указывать на ${EDGE_SOURCE_IP}
+  Проверка: dig +short ${SITE_DOMAIN}; dig +short ${PROXY_DOMAIN}
+
 Открой в cloud/firewall провайдера:
 
   A / РФ / этот сервер:
@@ -1076,6 +1081,10 @@ EOF
   prompt PROXY_DOMAIN "Домен proxy/SNI" "$PROXY_DOMAIN"
   PROXY_DOMAIN="$(normalize_domain "$PROXY_DOMAIN")"
 
+  if [[ "$SITE_DOMAIN" == "$PROXY_DOMAIN" ]]; then
+    die "Домен сайта-заглушки и домен proxy/SNI должны быть разными. Пример: site=hid-net.ru, proxy=tg.hid-net.ru"
+  fi
+
   EDGE_PUBLIC_HOST="$PROXY_DOMAIN"
   TLS_DOMAIN="$PROXY_DOMAIN"
 
@@ -1104,6 +1113,7 @@ EOF
 
   echo
   echo "Шаг 8/8. Проверяю DNS-логику: сайт и proxy-домен должны указывать на РФ-сервер A."
+  echo "Если используешь Cloudflare — записи должны быть DNS only, без оранжевого облака/proxy."
 
   if [[ -z "$SSH_OPTS_STRING" ]]; then
     echo
@@ -1235,7 +1245,7 @@ EOF
   print_final_proxy_link "$FINAL_PROXY_LINK"
 
   if [[ -n "$ALL_PROXY_LINKS" ]]; then
-    echo "Все ссылки, которые вернул Telemt:"
+    echo "Дополнительные ссылки, которые вернул Telemt для теста:"
     printf '%s\n' "$ALL_PROXY_LINKS" | sed 's/^/  - /'
   else
     printf '%s\n' "$LINKS_OUTPUT"
